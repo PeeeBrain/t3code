@@ -222,6 +222,8 @@ export const make = Effect.gen(function* () {
     return [
       { provider: "claude" as const, dir: claudeDir },
       { provider: "codex" as const, dir: path.join(codexLayout.sharedHomePath, "sessions") },
+      // Pi keeps one shared home (`~/.pi/agent`); no settings override yet.
+      { provider: "pi" as const, dir: path.join(NodeOS.homedir(), ".pi", "agent", "sessions") },
     ];
   });
 
