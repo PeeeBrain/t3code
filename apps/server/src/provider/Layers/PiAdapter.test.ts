@@ -202,6 +202,53 @@ it.layer(piAdapterTestLayer)("PiAdapterLive", (it) => {
     }),
   );
 
+  it.effect("failed steers leave the original turn running", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-thread-steer-fail");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, { PI_MOCK_MODE: "hold", PI_FAIL_STEER: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const collected = yield* collectEventsUntilTurnCompleted(adapter);
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "long running work",
+        attachments: [],
+      });
+      const steered = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "nudge",
+          attachments: [],
+        })
+        .pipe(Effect.result);
+      assert.isTrue(Result.isFailure(steered));
+      assert.equal(
+        collected.events.filter((event) => event.type === "turn.completed").length,
+        0,
+      );
+
+      yield* adapter.interruptTurn(threadId);
+      yield* collected.awaitTurnCompleted();
+      yield* collected.interrupt();
+
+      const completions = collected.events.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed",
+      );
+      assert.equal(completions.length, 1);
+      assert.equal(completions[0]?.payload.state, "cancelled");
+    }),
+  );
+
   it.effect("switches models before a new turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("pi-mock-model-switch");

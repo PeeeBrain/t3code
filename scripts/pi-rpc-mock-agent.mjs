@@ -106,6 +106,10 @@ rl.on("line", (line) => {
       }
       if (parsed.streamingBehavior !== undefined) {
         // Steered messages produce no new lifecycle of their own.
+        if (NodeProcess.env["PI_FAIL_STEER"] === "1") {
+          respond(id, "prompt", false);
+          return;
+        }
         respond(id, "prompt", true);
         return;
       }

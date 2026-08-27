@@ -496,7 +496,7 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
             keepStdoutOpen: true,
           },
         ]),
-      ).pipe(Effect.fork);
+      ).pipe(Effect.forkChild);
       yield* Effect.yieldNow;
       yield* TestClock.adjust("3 seconds");
       const snapshot = yield* Fiber.join(fiber);

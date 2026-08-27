@@ -883,7 +883,9 @@ export function makePiAdapter(
               Effect.tapError((error) =>
                 error.message.includes("did not respond")
                   ? stopSessionInternal(ctx)
-                  : settleTurn(ctx, "failed", error.message),
+                  : steering
+                    ? Effect.void
+                    : settleTurn(ctx, "failed", error.message),
               ),
             );
             return { ctx, turnId };
