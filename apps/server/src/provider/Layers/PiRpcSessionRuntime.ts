@@ -89,7 +89,6 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
  * the adapter, and tests agree on how sessions are addressed.
  */
 export function buildPiRpcArgs(input: {
-  readonly settings: PiSettings;
   readonly sessionId: string;
   readonly modelId?: string | undefined;
 }): ReadonlyArray<string> {
@@ -99,8 +98,6 @@ export function buildPiRpcArgs(input: {
     "--session-id",
     input.sessionId,
     ...(input.modelId ? ["--model", input.modelId] : []),
-    // Custom models from T3 settings are appended as extra --model patterns so
-    // they join pi's own catalog rather than replacing it.
   ];
 }
 

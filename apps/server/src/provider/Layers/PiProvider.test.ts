@@ -35,9 +35,12 @@ type ProbeProcess = {
   readonly exitCode?: Effect.Effect<ChildProcessSpawner.ExitCode>;
   /** Makes the spawn itself never settle so the probe's timeout is what fires. */
   readonly hangSpawn?: boolean;
+  /** Emits stdout then stays open, so a missing sibling RPC cannot end the stream. */
+  readonly keepStdoutOpen?: boolean;
 };
 
 function makeProbeHandle(input: ProbeProcess) {
+  const stdout = Stream.encodeText(Stream.make(input.stdout ?? ""));
   return ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(1),
     exitCode: input.exitCode ?? Effect.succeed(ChildProcessSpawner.ExitCode(input.code ?? 0)),
@@ -45,7 +48,7 @@ function makeProbeHandle(input: ProbeProcess) {
     kill: () => Effect.void,
     unref: Effect.succeed(Effect.void),
     stdin: Sink.drain,
-    stdout: Stream.encodeText(Stream.make(input.stdout ?? "")),
+    stdout: input.keepStdoutOpen ? Stream.concat(stdout, Stream.never) : stdout,
     stderr: Stream.encodeText(Stream.make(input.stderr ?? "")),
     all: Stream.empty,
     getInputFd: () => Sink.drain,
@@ -335,12 +338,13 @@ describe("parsePiCommandsResponse", () => {
 
 describe("configured-provider filtering", () => {
   it("parses auth store provider keys and ignores malformed stores", () => {
-    expect([...parsePiAuthProviderStore('{"anthropic":{},"openai-codex":{}}')]).toEqual([
+    expect([...parsePiAuthProviderStore('{"anthropic":{},"openai-codex":{}}') ?? []]).toEqual([
       "anthropic",
       "openai-codex",
     ]);
-    expect(parsePiAuthProviderStore("not json").size).toBe(0);
-    expect(parsePiAuthProviderStore("[1,2]").size).toBe(0);
+    expect(parsePiAuthProviderStore("not json")).toBeNull();
+    expect(parsePiAuthProviderStore("[1,2]")).toBeNull();
+    expect(parsePiAuthProviderStore("{}")?.size).toBe(0);
   });
 
   it("keeps only models from configured providers and skips filtering without a store", () => {
@@ -355,6 +359,7 @@ describe("configured-provider filtering", () => {
     expect(filterModelsByConfiguredProviders(models, new Set(["openai"]))[0]?.slug).toBe(
       "openai/gpt-5",
     );
+    expect(filterModelsByConfiguredProviders(models, new Set())).toHaveLength(0);
   });
 });
 
@@ -452,6 +457,54 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
       });
       expect(snapshot.message).toBe("1 available upstream provider found by Pi.");
       expect(snapshot.models.map((model) => model.slug)).toEqual(["openai/gpt-5"]);
+    }),
+  );
+
+  it.effect("reports warning/unauthenticated when the auth store is present but empty", () =>
+    Effect.gen(function* () {
+      const authDir = yield* makeIsolatedAuthDir;
+      yield* writeAuthStore(authDir, {});
+      const snapshot = yield* runCheck(
+        makeProbeSpawner([
+          { stdout: "pi 0.84.3\n" },
+          {
+            stdout: rpcInventoryStdout(
+              [rpcModelRow({ provider: "anthropic", id: "claude-sonnet-4-5", reasoning: true })],
+              [],
+            ),
+          },
+        ]),
+        makePiSettings(),
+        { PI_CODING_AGENT_DIR: authDir },
+      );
+
+      expect(snapshot.status).toBe("warning");
+      expect(snapshot.auth).toEqual({ status: "unauthenticated" });
+      expect(snapshot.message).toBe("Pi is installed, but no authenticated providers were found.");
+    }),
+  );
+
+  it.effect("keeps models when command discovery never arrives", () =>
+    Effect.gen(function* () {
+      const fiber = yield* runCheck(
+        makeProbeSpawner([
+          { stdout: "pi 0.84.3\n" },
+          {
+            stdout: `${rpcModelsLine([
+              rpcModelRow({ provider: "openai", id: "gpt-5", reasoning: false, thinkingLevels: [] }),
+            ])}\n`,
+            keepStdoutOpen: true,
+          },
+        ]),
+      ).pipe(Effect.fork);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("3 seconds");
+      const snapshot = yield* Fiber.join(fiber);
+
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.models.map((model) => model.slug)).toEqual(["openai/gpt-5"]);
+      expect(snapshot.slashCommands).toEqual([]);
+      expect(snapshot.skills).toEqual([]);
     }),
   );
 

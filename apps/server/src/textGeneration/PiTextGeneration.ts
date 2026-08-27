@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import { type PiSettings, type ModelSelection, TextGenerationError } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
@@ -57,8 +58,10 @@ export const makePiTextGenerationService = (
       const spawnCommand = yield* resolveSpawnCommand(
         piSettings.binaryPath,
         // Headless one-shot: no session file, no tool execution, plain text on
-        // stdout. Tools stay off because these prompts only need prose.
-        ["--print", "--no-session", "--no-tools", prompt],
+        // stdout. Tools stay off because these prompts only need prose. The
+        // prompt itself travels on stdin so Windows cmd.exe length limits
+        // cannot truncate a commit or PR diff.
+        ["--print", "--no-session", "--no-tools"],
         { env: environment },
       ).pipe(
         Effect.mapError(
@@ -77,6 +80,9 @@ export const makePiTextGenerationService = (
           shell: spawnCommand.shell,
           ...(cwd ? { cwd } : {}),
           env: environment,
+          stdin: {
+            stream: Stream.encodeText(Stream.make(prompt)),
+          },
         }),
       ).pipe(
         Effect.mapError(

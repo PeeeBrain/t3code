@@ -9,13 +9,14 @@ import {
 import { causeErrorTag } from "@t3tools/shared/observability";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
-import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as Ndjson from "effect/unstable/encoding/Ndjson";
 import { HttpClient } from "effect/unstable/http";
@@ -88,6 +89,8 @@ export function buildPiReasoningCapabilities(
 
 const VERSION_PROBE_TIMEOUT_MS = 4_000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
+/** After the first inventory RPC reply, wait this long for the sibling. */
+const PI_RPC_INVENTORY_IDLE_MS = 2_000;
 const UnknownRecord = Schema.Record(Schema.String, Schema.Unknown);
 const isUnknownRecord = Schema.is(UnknownRecord);
 const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -277,16 +280,16 @@ export function countPiUpstreamProviders(models: ReadonlyArray<ServerProviderMod
  * picker. The auth store (`<agentDir>/auth.json`) holds exactly the providers
  * the user configured with Pi, so it is the truth for what belongs in the
  * picker. `null` means the store was absent or unreadable and filtering is
- * skipped.
+ * skipped. An empty set is a readable store with no configured providers.
  */
-export function parsePiAuthProviderStore(text: string): ReadonlySet<string> {
+export function parsePiAuthProviderStore(text: string): ReadonlySet<string> | null {
   let value: unknown;
   try {
     value = JSON.parse(text);
   } catch {
-    return new Set();
+    return null;
   }
-  if (!isUnknownRecord(value)) return new Set();
+  if (!isUnknownRecord(value)) return null;
   const providers = new Set<string>();
   for (const key of Object.keys(value)) {
     if (key.trim()) providers.add(key.trim());
@@ -298,7 +301,7 @@ export function filterModelsByConfiguredProviders(
   models: ReadonlyArray<ServerProviderModel>,
   providers: ReadonlySet<string> | null,
 ): ReadonlyArray<ServerProviderModel> {
-  if (providers === null || providers.size === 0) return models;
+  if (providers === null) return models;
   return models.filter((model) => {
     const separator = model.slug.indexOf("/");
     return separator > 0 && providers.has(model.slug.slice(0, separator));
@@ -372,24 +375,33 @@ const discoverPiInventoryViaRpc = (
       ),
       child.stdin,
     ).pipe(Effect.ignore, Effect.forkScoped);
-    // Exactly two responses match the filter; the bounded sink stops as soon
-    // as both arrived instead of waiting for the process to exit.
-    const responses = yield* child.stdout.pipe(
+    const collected = yield* Ref.make<Array<unknown>>([]);
+    const settled = yield* Deferred.make<void>();
+    const settle = Deferred.succeed(settled, undefined).pipe(Effect.asVoid, Effect.ignore);
+    const isInventoryResponse = (value: unknown): boolean =>
+      isUnknownRecord(value) &&
+      value["type"] === "response" &&
+      (value["id"] === PI_RPC_MODELS_ID || value["id"] === PI_RPC_COMMANDS_ID);
+    yield* child.stdout.pipe(
       Stream.pipeThroughChannel(Ndjson.decode({ ignoreEmptyLines: true })),
-      Stream.filter(
-        (value) =>
-          isUnknownRecord(value) &&
-          value["type"] === "response" &&
-          (value["id"] === PI_RPC_MODELS_ID || value["id"] === PI_RPC_COMMANDS_ID),
+      Stream.runForEach((value) =>
+        Effect.gen(function* () {
+          if (!isInventoryResponse(value)) return;
+          const next = yield* Ref.updateAndGet(collected, (acc) => [...acc, value]);
+          if (next.length === 1) {
+            yield* Effect.sleep(`${PI_RPC_INVENTORY_IDLE_MS} millis`).pipe(
+              Effect.andThen(settle),
+              Effect.forkScoped,
+            );
+          }
+          if (next.length >= 2) yield* settle;
+        }),
       ),
-      Stream.run(
-        Sink.foldUntil(
-          () => [] as Array<unknown>,
-          2,
-          (acc: Array<unknown>, value: unknown) => Effect.succeed([...acc, value]),
-        ),
-      ),
+      Effect.andThen(settle),
+      Effect.forkScoped,
     );
+    yield* Deferred.await(settled);
+    const responses = yield* Ref.get(collected);
     yield* child.kill().pipe(Effect.ignore);
     const pick = (id: string): PiRpcResult => {
       for (const value of responses) {

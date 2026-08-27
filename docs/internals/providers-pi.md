@@ -49,6 +49,9 @@ per-model reasoning selector; the default is `medium` when supported, otherwise 
 supported level. Neither RPC nor the CLI table filters by authentication, so the probe intersects
 the discovered model set with the provider keys stored in Pi's credential store
 (`<PI_CODING_AGENT_DIR or ~/.pi/agent>/auth.json`) and counts the distinct providers that survive.
+A missing or unreadable store skips that filter; a readable empty store (`{}`) is treated as no
+configured providers.
+
 Ambient environment tokens (for example `ANTHROPIC_AUTH_TOKEN`) make `pi auth check` report a
 provider ready without a store entry, so the store — not `pi auth check` — is the truth for what
 belongs in the picker. RPC still does not expose SDK-style `getProviders()` or `checkAuth()`, so
