@@ -61,8 +61,9 @@ to use, then authenticate it.
 | Cursor     | [Cursor CLI](https://cursor.com/cli)                  | `cursor-agent` | `agent login`         |
 | Grok Build | [Grok Build CLI](https://x.ai/cli)                    | `grok`         | `grok login`          |
 | OpenCode   | [OpenCode](https://opencode.ai)                       | `opencode`     | `opencode auth login` |
+| Pi         | [Pi](https://pi.dev/docs/latest/)                     | `pi`           | Pi's `/login`         |
 
-Codex and Claude are on by default. Cursor, Grok Build, and OpenCode are off by default; turn
+Codex and Claude are on by default. Cursor, Grok Build, Pi, and OpenCode are off by default; turn
 them on in **Settings** → the provider's card when you want to use them.
 
 Cursor is the one to watch: install Cursor CLI, which provides the `cursor-agent` binary that
@@ -85,7 +86,8 @@ T3 Code. You can install T3 Code, open it, and add providers afterwards. A provi
 authenticated shows its status in **Settings** and fails at session start with the login command
 to run.
 
-For multi-account setups, see [Codex](./providers-codex.md) and [Claude](./providers-claude.md).
+For provider-specific setup, see [Pi](./providers-pi.md), [Codex](./providers-codex.md), and
+[Claude](./providers-claude.md).
 
 ## Next Steps
 

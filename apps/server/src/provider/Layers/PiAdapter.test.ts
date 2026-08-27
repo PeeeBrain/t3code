@@ -10,8 +10,10 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import { TestClock } from "effect/testing";
 
 import {
   PiSettings,
@@ -70,8 +72,10 @@ const piAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-pi-adapter-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
-const makeTestAdapter = (binaryPath: string) =>
-  makePiAdapter(decodePiSettings({ binaryPath })).pipe(Effect.orDie);
+const makeTestAdapter = (binaryPath: string, requestTimeoutMs?: number) =>
+  makePiAdapter(decodePiSettings({ binaryPath }), {
+    ...(requestTimeoutMs !== undefined ? { requestTimeoutMs } : {}),
+  }).pipe(Effect.orDie);
 
 function collectEventsUntilTurnCompleted(adapter: {
   readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
@@ -143,6 +147,7 @@ it.layer(piAdapterTestLayer)("PiAdapterLive", (it) => {
         "thread.started",
         "turn.started",
         "turn.completed",
+        "item.started",
         "item.completed",
       ]);
       assert.isTrue(types.includes("content.delta"));
@@ -152,6 +157,12 @@ it.layer(piAdapterTestLayer)("PiAdapterLive", (it) => {
           event.type === "content.delta",
       );
       assert.deepEqual(deltas.map((event) => event.payload.delta).join(""), "Hello world");
+      const assistantCompletions = collected.events.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.completed" }> =>
+          event.type === "item.completed" && event.payload.itemType === "assistant_message",
+      );
+      assert.equal(assistantCompletions.length, 2);
+      assert.equal(new Set(assistantCompletions.map((event) => event.itemId)).size, 2);
     }),
   );
 
@@ -188,6 +199,136 @@ it.layer(piAdapterTestLayer)("PiAdapterLive", (it) => {
       );
       assert.equal(completions.length, 1);
       assert.equal(completions[0]?.payload.state, "cancelled");
+    }),
+  );
+
+  it.effect("switches models before a new turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-model-switch");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, { PI_EXPECT_THINKING: "high" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const collected = yield* collectEventsUntilTurnCompleted(adapter);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "use the other model",
+        attachments: [],
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("pi"),
+          model: "other/new-model",
+          options: [{ id: "reasoningEffort", value: "high" }],
+        },
+      });
+      yield* collected.awaitTurnCompleted();
+      const sessions = yield* adapter.listSessions();
+      yield* collected.interrupt();
+
+      assert.equal(sessions[0]?.model, "other/new-model");
+    }),
+  );
+
+  it.effect("fails an active turn and exits the session when Pi dies", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-exit");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, { PI_MOCK_MODE: "exit" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const events: ProviderRuntimeEvent[] = [];
+      const exited = yield* Deferred.make<void>();
+      const fiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => events.push(event)).pipe(
+          Effect.andThen(
+            event.type === "session.exited" ? Deferred.succeed(exited, undefined) : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "crash", attachments: [] });
+      yield* Deferred.await(exited);
+      yield* Fiber.interrupt(fiber);
+
+      const completion = events.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed",
+      );
+      const sessionExit = events.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "session.exited" }> =>
+          event.type === "session.exited",
+      );
+      assert.equal(completion?.payload.state, "failed");
+      assert.equal(sessionExit?.payload.exitKind, "error");
+      assert.isFalse(yield* adapter.hasSession(threadId));
+    }),
+  );
+
+  it.effect("settles completed after an automatic retry recovers", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-retry");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, { PI_MOCK_MODE: "retry" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const collected = yield* collectEventsUntilTurnCompleted(adapter);
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({ threadId, input: "retry", attachments: [] });
+      yield* collected.awaitTurnCompleted();
+      yield* collected.interrupt();
+      const completion = collected.events.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed",
+      );
+      assert.equal(completion?.payload.state, "completed");
+    }),
+  );
+
+  it.effect("times out an unacknowledged Pi request instead of hanging", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-timeout");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, { PI_MOCK_MODE: "ignore-prompt" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath, 50);
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const fiber = yield* adapter
+        .sendTurn({ threadId, input: "never acknowledged", attachments: [] })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("100 millis");
+      const result = yield* Fiber.join(fiber);
+      assert.isTrue(Result.isFailure(result));
+      if (Result.isFailure(result)) assert.match(result.failure.message, /did not respond/i);
+      assert.isFalse(yield* adapter.hasSession(threadId));
     }),
   );
 });

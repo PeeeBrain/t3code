@@ -15,9 +15,11 @@
  * @module PiRpcSessionRuntime
  */
 import { type PiSettings } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -52,6 +54,8 @@ export interface PiRpcSpawnInput {
   readonly sessionId: string;
   /** Optional `provider/model-id` or model pattern for this session. */
   readonly modelId?: string | undefined;
+  /** Request deadline; exposed so transport tests can use a short timeout. */
+  readonly requestTimeoutMs?: number | undefined;
 }
 
 export interface PiRpcSessionRuntime {
@@ -64,6 +68,7 @@ export interface PiRpcSessionRuntime {
    */
   readonly request: (
     command: Record<string, unknown>,
+    timeoutMs?: number,
   ) => Effect.Effect<Record<string, unknown>, PiRuntimeError>;
   /** Sends a command without awaiting any response (e.g. `abort`). */
   readonly notify: (command: Record<string, unknown>) => Effect.Effect<void, PiRuntimeError>;
@@ -75,10 +80,9 @@ export interface PiRpcSessionRuntime {
 
 /** Commands whose dialogs block pi until answered; everything else is fire-and-forget. */
 const BLOCKING_EXTENSION_UI_METHODS = new Set(["select", "confirm", "input", "editor"]);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const UnknownRecord = Schema.Record(Schema.String, Schema.Unknown);
+const isUnknownRecord = Schema.is(UnknownRecord);
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * Builds the argv tail for `pi --mode rpc`. Kept in one place so the probe,
@@ -123,7 +127,7 @@ export const makePiRpcSessionRuntime = (
     const pendingRef = yield* Ref.make(
       new Map<string, Deferred.Deferred<Record<string, unknown>, PiRuntimeError>>(),
     );
-    const startedRef = yield* Ref.make(false);
+    const lifecycleRef = yield* Ref.make<"idle" | "running" | "closed">("idle");
     const exitDeferred = yield* Deferred.make<number, never>();
     let handle: ChildProcessSpawner.ChildProcessHandle | undefined;
 
@@ -171,14 +175,19 @@ export const makePiRpcSessionRuntime = (
 
     const handleLine = (value: unknown): Effect.Effect<void> =>
       Effect.gen(function* () {
-        if (!isRecord(value)) return;
+        if (!isUnknownRecord(value)) return;
         if (value["type"] === "response") {
           const id = typeof value["id"] === "string" ? value["id"] : undefined;
           if (id === undefined) return;
           const pending = (yield* Ref.get(pendingRef)).get(id);
           if (!pending) return;
           if (value["success"] === true) {
-            const data = isRecord(value["data"]) ? value["data"] : {};
+            const data = isUnknownRecord(value["data"]) ? value["data"] : {};
+            yield* Ref.update(pendingRef, (current) => {
+              const next = new Map(current);
+              next.delete(id);
+              return next;
+            });
             yield* Deferred.succeed(pending, data).pipe(Effect.asVoid, Effect.ignore);
           } else {
             const error =
@@ -190,6 +199,11 @@ export const makePiRpcSessionRuntime = (
                 detail: error,
               }),
             ).pipe(Effect.ignore);
+            yield* Ref.update(pendingRef, (current) => {
+              const next = new Map(current);
+              next.delete(id);
+              return next;
+            });
           }
           return;
         }
@@ -198,7 +212,7 @@ export const makePiRpcSessionRuntime = (
 
     const answerBlockingDialogs = (value: unknown): Effect.Effect<void> =>
       Effect.gen(function* () {
-        if (!isRecord(value) || value["type"] !== "extension_ui_request") return;
+        if (!isUnknownRecord(value) || value["type"] !== "extension_ui_request") return;
         const method = value["method"];
         if (typeof method !== "string" || !BLOCKING_EXTENSION_UI_METHODS.has(method)) return;
         // Pi has no permission gate; its only blocking dialogs are extension
@@ -213,8 +227,14 @@ export const makePiRpcSessionRuntime = (
 
     const start = (): Effect.Effect<void, PiRuntimeError> =>
       Effect.gen(function* () {
-        if (yield* Ref.get(startedRef)) return;
-        yield* Ref.set(startedRef, true);
+        const lifecycle = yield* Ref.get(lifecycleRef);
+        if (lifecycle === "running") return;
+        if (lifecycle === "closed") {
+          return yield* new PiRuntimeError({
+            operation: "start",
+            detail: "Pi runtime has already closed.",
+          });
+        }
 
         const args = buildPiRpcArgs(input);
         const childEnvironment = input.environment ?? process.env;
@@ -240,11 +260,25 @@ export const makePiRpcSessionRuntime = (
             ),
           );
         handle = child;
+        yield* Ref.set(lifecycleRef, "running");
+
+        const failTransport = (detail: string) =>
+          Effect.gen(function* () {
+            yield* Ref.set(lifecycleRef, "closed");
+            yield* failPending(detail);
+            if (handle) yield* handle.kill().pipe(Effect.ignore);
+          });
 
         // One stdin pump for the process's whole life: the queue-backed stream
         // never completes, so pi never sees EOF until we kill it.
         yield* Stream.run(Stream.encodeText(Stream.fromQueue(writeQueue)), child.stdin).pipe(
-          Effect.ignore,
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.void
+              : Effect.logError("Pi RPC stdin pump failed.", { cause }).pipe(
+                  Effect.andThen(failTransport("Pi stdin transport failed.")),
+                ),
+          ),
           Effect.forkIn(scope),
         );
 
@@ -259,7 +293,13 @@ export const makePiRpcSessionRuntime = (
             ),
           ),
           Stream.runDrain,
-          Effect.ignore,
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.void
+              : Effect.logError("Pi RPC stdout pump failed.", { cause }).pipe(
+                  Effect.andThen(failTransport("Pi stdout transport failed.")),
+                ),
+          ),
           Effect.forkIn(scope),
         );
         const stderrTailRef = yield* Ref.make("");
@@ -277,6 +317,7 @@ export const makePiRpcSessionRuntime = (
           Effect.flatMap((code) =>
             Effect.gen(function* () {
               handle = undefined;
+              yield* Ref.set(lifecycleRef, "closed");
               const stderrTail = (yield* Ref.get(stderrTailRef)).trim();
               if (Number(code) !== 0 || stderrTail.length > 0) {
                 yield* Effect.logWarning("Pi CLI process exited.", {
@@ -293,8 +334,14 @@ export const makePiRpcSessionRuntime = (
         );
       });
 
-    const request = (command: Record<string, unknown>) =>
+    const request = (command: Record<string, unknown>, timeoutMs?: number) =>
       Effect.gen(function* () {
+        if ((yield* Ref.get(lifecycleRef)) !== "running") {
+          return yield* new PiRuntimeError({
+            operation: "request",
+            detail: "Pi process is not running.",
+          });
+        }
         const id = yield* randomId;
         const deferred = yield* Deferred.make<Record<string, unknown>, PiRuntimeError>();
         yield* Ref.update(pendingRef, (pending) => {
@@ -311,7 +358,19 @@ export const makePiRpcSessionRuntime = (
             }),
           ),
         );
-        return yield* Deferred.await(deferred);
+        const result = yield* Deferred.await(deferred).pipe(
+          Effect.timeoutOption(timeoutMs ?? input.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
+        );
+        if (Option.isSome(result)) return result.value;
+        yield* Ref.update(pendingRef, (pending) => {
+          const next = new Map(pending);
+          next.delete(id);
+          return next;
+        });
+        return yield* new PiRuntimeError({
+          operation: typeof command["type"] === "string" ? command["type"] : "request",
+          detail: `Pi did not respond within ${timeoutMs ?? input.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS}ms.`,
+        });
       });
 
     const notify = (command: Record<string, unknown>) => writeLine(command);
@@ -325,6 +384,7 @@ export const makePiRpcSessionRuntime = (
         if (handle) {
           yield* handle.kill().pipe(Effect.ignore);
         }
+        yield* Ref.set(lifecycleRef, "closed");
         yield* failPending("Pi runtime was torn down.");
       }),
     );
@@ -349,11 +409,22 @@ export function piSessionIdFromState(data: Record<string, unknown>): string | un
 
 export function piModelFromState(data: Record<string, unknown>): string | undefined {
   const model = data["model"];
-  if (!isRecord(model)) return undefined;
+  if (!isUnknownRecord(model)) return undefined;
+  const provider = model["provider"];
   const id = model["id"];
-  return typeof id === "string" && id.trim() ? id.trim() : undefined;
+  if (typeof id !== "string" || !id.trim()) return undefined;
+  return typeof provider === "string" && provider.trim()
+    ? `${provider.trim()}/${id.trim()}`
+    : id.trim();
 }
 
 export function piStreamingFromState(data: Record<string, unknown>): boolean {
   return data["isStreaming"] === true || data["isCompacting"] === true;
+}
+
+export function piThinkingLevelFromState(data: Record<string, unknown>): string | undefined {
+  const thinkingLevel = data["thinkingLevel"];
+  return typeof thinkingLevel === "string" && thinkingLevel.trim()
+    ? thinkingLevel.trim()
+    : undefined;
 }

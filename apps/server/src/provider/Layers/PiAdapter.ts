@@ -23,6 +23,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
@@ -30,6 +31,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -38,14 +40,21 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import type { ProviderAdapterShape, ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
-import { makePiRpcSessionRuntime, type PiRpcSessionRuntime } from "./PiRpcSessionRuntime.ts";
+import {
+  makePiRpcSessionRuntime,
+  piModelFromState,
+  piThinkingLevelFromState,
+  type PiRpcSessionRuntime,
+} from "./PiRpcSessionRuntime.ts";
 
 const PROVIDER = ProviderDriverKind.make("pi");
 const PI_RESUME_VERSION = 1 as const;
+const PI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 export interface PiAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly instanceId?: ProviderInstanceId;
+  readonly requestTimeoutMs?: number;
 }
 
 interface PiSessionContext {
@@ -56,18 +65,21 @@ interface PiSessionContext {
   session: ProviderSession;
   readonly scope: Scope.Closeable;
   notificationFiber: Fiber.Fiber<void, never> | undefined;
+  exitFiber: Fiber.Fiber<void, never> | undefined;
   activeTurnId: TurnId | undefined;
+  assistantItemId: RuntimeItemId | undefined;
+  pendingFailureMessage: string | undefined;
   /** Turns aborted locally whose `agent_settled` must land as cancelled. */
   readonly interruptedTurnIds: Set<TurnId>;
   streaming: boolean;
   currentModelId: string | undefined;
+  currentThinkingLevel: string | undefined;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
   stopped: boolean;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const UnknownRecord = Schema.Record(Schema.String, Schema.Unknown);
+const isRecord = Schema.is(UnknownRecord);
 
 function parsePiResume(raw: unknown): { sessionId: string } | undefined {
   if (!isRecord(raw)) return undefined;
@@ -101,11 +113,10 @@ function piToolCallFromEvent(
   return { toolCallId, toolName };
 }
 
-function piModelIdFromState(data: Record<string, unknown>): string | undefined {
-  const model = data["model"];
-  if (!isRecord(model)) return undefined;
-  const id = model["id"];
-  return typeof id === "string" && id.trim() ? id.trim() : undefined;
+function piModelParts(model: string): { provider: string; modelId: string } | undefined {
+  const separator = model.indexOf("/");
+  if (separator <= 0 || separator === model.length - 1) return undefined;
+  return { provider: model.slice(0, separator), modelId: model.slice(separator + 1) };
 }
 
 /** Extracts `{kind, delta}` from a `message_update` carrying a text/thinking delta. */
@@ -225,6 +236,8 @@ export function makePiAdapter(
         const turnId = ctx.activeTurnId ?? ctx.session.activeTurnId;
         ctx.streaming = false;
         ctx.activeTurnId = undefined;
+        ctx.assistantItemId = undefined;
+        ctx.pendingFailureMessage = undefined;
         const updatedAt = yield* nowIso;
         const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
         ctx.session = { ...readySession, status: "ready", updatedAt };
@@ -260,22 +273,55 @@ export function makePiAdapter(
           const wasInterrupted =
             ctx.activeTurnId !== undefined && ctx.interruptedTurnIds.has(ctx.activeTurnId);
           if (ctx.activeTurnId !== undefined) ctx.interruptedTurnIds.delete(ctx.activeTurnId);
-          yield* settleTurn(ctx, wasInterrupted ? "cancelled" : "completed");
+          const failureMessage = ctx.pendingFailureMessage;
+          yield* settleTurn(
+            ctx,
+            wasInterrupted ? "cancelled" : failureMessage ? "failed" : "completed",
+            failureMessage,
+          );
           return;
         }
         if (eventType === "agent_start") {
           ctx.streaming = true;
           return;
         }
+        if (eventType === "message_start") {
+          const message = value["message"];
+          if (!ctx.activeTurnId || !isRecord(message) || message["role"] !== "assistant") return;
+          ctx.assistantItemId = RuntimeItemId.make(yield* randomUUIDv4);
+          yield* offerRuntimeEvent({
+            type: "item.started",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            turnId: ctx.activeTurnId,
+            itemId: ctx.assistantItemId,
+            payload: { itemType: "assistant_message", status: "inProgress" },
+          });
+          return;
+        }
         if (eventType === "message_update") {
           const delta = piContentDelta(value);
           if (delta) {
+            if (!ctx.assistantItemId && ctx.activeTurnId) {
+              ctx.assistantItemId = RuntimeItemId.make(yield* randomUUIDv4);
+              yield* offerRuntimeEvent({
+                type: "item.started",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: ctx.threadId,
+                turnId: ctx.activeTurnId,
+                itemId: ctx.assistantItemId,
+                payload: { itemType: "assistant_message", status: "inProgress" },
+              });
+            }
             yield* offerRuntimeEvent({
               type: "content.delta",
               ...(yield* makeEventStamp()),
               provider: PROVIDER,
               threadId: ctx.threadId,
               ...(ctx.activeTurnId ? { turnId: ctx.activeTurnId } : {}),
+              ...(ctx.assistantItemId ? { itemId: ctx.assistantItemId } : {}),
               payload: { streamKind: delta.kind, delta: delta.delta },
               raw: { source: "pi.rpc", messageType: "message_update", payload: value },
             });
@@ -296,21 +342,48 @@ export function makePiAdapter(
         if (eventType === "message_end") {
           const message = value["message"];
           if (!isRecord(message) || message["role"] !== "assistant") return;
-          const itemId = typeof message["id"] === "string" ? message["id"] : undefined;
           const turnId = ctx.activeTurnId;
-          if (itemId && turnId) {
+          if (turnId) {
+            let itemId = ctx.assistantItemId;
+            if (!itemId) {
+              itemId = RuntimeItemId.make(
+                typeof message["id"] === "string" ? message["id"] : yield* randomUUIDv4,
+              );
+              ctx.assistantItemId = itemId;
+              yield* offerRuntimeEvent({
+                type: "item.started",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: ctx.threadId,
+                turnId,
+                itemId,
+                payload: { itemType: "assistant_message", status: "inProgress" },
+              });
+            }
             const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
             if (turnRecord) turnRecord.items.push(message);
+            const stopReason = message["stopReason"];
+            const errorMessage = message["errorMessage"];
+            if (stopReason === "error") {
+              ctx.pendingFailureMessage =
+                typeof errorMessage === "string" && errorMessage.trim()
+                  ? errorMessage.trim()
+                  : "Pi assistant response failed.";
+            }
             yield* offerRuntimeEvent({
               type: "item.completed",
               ...(yield* makeEventStamp()),
               provider: PROVIDER,
               threadId: ctx.threadId,
               turnId,
-              itemId: RuntimeItemId.make(itemId),
-              payload: { itemType: "assistant_message", status: "completed" },
+              itemId,
+              payload: {
+                itemType: "assistant_message",
+                status: stopReason === "error" ? "failed" : "completed",
+              },
               raw: { source: "pi.rpc", messageType: "message_end", payload: value },
             });
+            ctx.assistantItemId = undefined;
           }
           return;
         }
@@ -323,8 +396,21 @@ export function makePiAdapter(
           if (!call || !ctx.activeTurnId) return;
           const itemType = itemTypeFromPiToolName(call.toolName);
           const isError = eventType === "tool_execution_end" && value["isError"] === true;
+          const data = {
+            toolName: call.toolName,
+            ...(isRecord(value["args"]) ? { input: value["args"] } : {}),
+            ...(value["partialResult"] !== undefined
+              ? { partialResult: value["partialResult"] }
+              : {}),
+            ...(value["result"] !== undefined ? { result: value["result"] } : {}),
+          };
           yield* offerRuntimeEvent({
-            type: eventType === "tool_execution_end" ? "item.completed" : "item.updated",
+            type:
+              eventType === "tool_execution_start"
+                ? "item.started"
+                : eventType === "tool_execution_end"
+                  ? "item.completed"
+                  : "item.updated",
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
             threadId: ctx.threadId,
@@ -339,15 +425,14 @@ export function makePiAdapter(
                     : ("completed" as const)
                   : ("inProgress" as const),
               title: call.toolName,
-              ...(isRecord(value["args"]) && Object.keys(value["args"]).length > 0
-                ? { data: value["args"] }
-                : {}),
+              data,
             },
             raw: { source: "pi.rpc", messageType: eventType, payload: value },
           });
           return;
         }
         if (eventType === "auto_retry_start") {
+          ctx.pendingFailureMessage = undefined;
           yield* offerRuntimeEvent({
             type: "session.state.changed",
             ...(yield* makeEventStamp()),
@@ -355,12 +440,34 @@ export function makePiAdapter(
             threadId: ctx.threadId,
             payload: { state: "running", reason: "Pi auto-retry started" },
           });
+          return;
+        }
+        if (eventType === "auto_retry_end") {
+          if (value["success"] === true) {
+            ctx.pendingFailureMessage = undefined;
+          } else if (value["success"] === false) {
+            ctx.pendingFailureMessage =
+              typeof value["finalError"] === "string" && value["finalError"].trim()
+                ? value["finalError"].trim()
+                : "Pi exhausted its automatic retries.";
+          }
+          return;
+        }
+        if (
+          eventType === "compaction_end" &&
+          value["aborted"] !== true &&
+          value["willRetry"] !== true &&
+          typeof value["errorMessage"] === "string" &&
+          value["errorMessage"].trim()
+        ) {
+          ctx.pendingFailureMessage = value["errorMessage"].trim();
         }
       });
 
     const stopSessionInternal = (ctx: PiSessionContext) =>
       Effect.gen(function* () {
         if (ctx.stopped) return;
+        if (ctx.streaming) yield* settleTurn(ctx, "cancelled");
         ctx.stopped = true;
         yield* Effect.ignore(ctx.runtime.notify({ type: "abort" }));
         if (ctx.notificationFiber) {
@@ -421,6 +528,7 @@ export function makePiAdapter(
             cwd,
             sessionId: piSessionId,
             ...(modelSelection?.model ? { modelId: modelSelection.model } : {}),
+            ...(options?.requestTimeoutMs ? { requestTimeoutMs: options.requestTimeoutMs } : {}),
           }).pipe(
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
             Effect.provideService(Crypto.Crypto, crypto),
@@ -447,15 +555,17 @@ export function makePiAdapter(
             session,
             scope: sessionScope,
             notificationFiber: undefined,
+            exitFiber: undefined,
             activeTurnId: undefined,
+            assistantItemId: undefined,
+            pendingFailureMessage: undefined,
             interruptedTurnIds: new Set(),
             streaming: false,
             currentModelId: modelSelection?.model,
+            currentThinkingLevel: undefined,
             turns: [],
             stopped: false,
           };
-          sessions.set(input.threadId, ctx);
-
           // Pump first, then start: pi emits events (extension UI prompts)
           // before any command response arrives.
           ctx.notificationFiber = yield* Stream.runForEach(runtime.events, (event) =>
@@ -495,9 +605,36 @@ export function makePiAdapter(
                   cause,
                 }),
             ),
-            Effect.catchTag("ProviderAdapterRequestError", () => Effect.succeed({})),
           );
-          ctx.currentModelId = piModelIdFromState(stateData) ?? ctx.currentModelId;
+          ctx.currentModelId = piModelFromState(stateData) ?? ctx.currentModelId;
+          ctx.currentThinkingLevel = piThinkingLevelFromState(stateData);
+          const requestedThinkingLevel = getModelSelectionStringOptionValue(
+            modelSelection,
+            "reasoningEffort",
+          );
+          if (requestedThinkingLevel && !PI_THINKING_LEVELS.has(requestedThinkingLevel)) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: `Unsupported Pi reasoning level '${requestedThinkingLevel}'.`,
+            });
+          }
+          if (requestedThinkingLevel && requestedThinkingLevel !== ctx.currentThinkingLevel) {
+            yield* runtime
+              .request({ type: "set_thinking_level", level: requestedThinkingLevel })
+              .pipe(
+                Effect.mapError(
+                  (cause): ProviderAdapterRequestError =>
+                    new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "set_thinking_level",
+                      detail: cause.message,
+                      cause,
+                    }),
+                ),
+              );
+            ctx.currentThinkingLevel = requestedThinkingLevel;
+          }
 
           const readySession: ProviderSession = {
             ...ctx.session,
@@ -506,7 +643,45 @@ export function makePiAdapter(
             updatedAt: yield* nowIso,
           };
           ctx.session = readySession;
+          sessions.set(input.threadId, ctx);
           sessionScopeTransferred = true;
+
+          ctx.exitFiber = yield* runtime.exitCode.pipe(
+            Effect.flatMap((exitCode) =>
+              withThreadLock(
+                input.threadId,
+                Effect.gen(function* () {
+                  if (ctx.stopped) return;
+                  const reason = `Pi CLI exited unexpectedly with code ${exitCode}.`;
+                  if (ctx.streaming) yield* settleTurn(ctx, "failed", reason);
+                  ctx.stopped = true;
+                  ctx.session = {
+                    ...ctx.session,
+                    status: "error",
+                    updatedAt: yield* nowIso,
+                  };
+                  sessions.delete(input.threadId);
+                  yield* offerRuntimeEvent({
+                    type: "session.state.changed",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    payload: { state: "error", reason },
+                  });
+                  yield* offerRuntimeEvent({
+                    type: "session.exited",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    payload: { exitKind: "error", reason, recoverable: true },
+                  });
+                  yield* Scope.close(ctx.scope, Exit.void).pipe(Effect.ignore);
+                }),
+              ),
+            ),
+            Effect.catchCause((cause) => Effect.logError("Pi exit watcher failed.", { cause })),
+            Effect.forkDetach,
+          );
 
           yield* offerRuntimeEvent({
             type: "session.started",
@@ -547,6 +722,73 @@ export function makePiAdapter(
             const turnId = steering
               ? (ctx.activeTurnId as TurnId)
               : TurnId.make(yield* randomUUIDv4);
+
+            const selectedModel =
+              input.modelSelection?.instanceId === boundInstanceId
+                ? input.modelSelection.model.trim()
+                : undefined;
+            if (!steering && selectedModel && selectedModel !== ctx.currentModelId) {
+              const model = piModelParts(selectedModel);
+              if (!model) {
+                return yield* new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "sendTurn",
+                  issue: `Pi model '${selectedModel}' must use provider/model-id format.`,
+                });
+              }
+              yield* ctx.runtime
+                .request({ type: "set_model", provider: model.provider, modelId: model.modelId })
+                .pipe(
+                  Effect.mapError(
+                    (cause): ProviderAdapterError =>
+                      new ProviderAdapterRequestError({
+                        provider: PROVIDER,
+                        method: "set_model",
+                        detail: cause.message,
+                        cause,
+                      }),
+                  ),
+                );
+              ctx.currentModelId = selectedModel;
+              ctx.currentThinkingLevel = undefined;
+              ctx.session = { ...ctx.session, model: selectedModel, updatedAt: yield* nowIso };
+            }
+
+            const selectedThinkingLevel =
+              input.modelSelection?.instanceId === boundInstanceId
+                ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
+                : undefined;
+            if (
+              !steering &&
+              selectedThinkingLevel &&
+              !PI_THINKING_LEVELS.has(selectedThinkingLevel)
+            ) {
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "sendTurn",
+                issue: `Unsupported Pi reasoning level '${selectedThinkingLevel}'.`,
+              });
+            }
+            if (
+              !steering &&
+              selectedThinkingLevel &&
+              selectedThinkingLevel !== ctx.currentThinkingLevel
+            ) {
+              yield* ctx.runtime
+                .request({ type: "set_thinking_level", level: selectedThinkingLevel })
+                .pipe(
+                  Effect.mapError(
+                    (cause): ProviderAdapterError =>
+                      new ProviderAdapterRequestError({
+                        provider: PROVIDER,
+                        method: "set_thinking_level",
+                        detail: cause.message,
+                        cause,
+                      }),
+                  ),
+                );
+              ctx.currentThinkingLevel = selectedThinkingLevel;
+            }
 
             const images = yield* Effect.forEach(
               input.attachments ?? [],
@@ -606,6 +848,8 @@ export function makePiAdapter(
             if (!steering) {
               ctx.activeTurnId = turnId;
               ctx.streaming = true;
+              ctx.assistantItemId = undefined;
+              ctx.pendingFailureMessage = undefined;
               const updatedAt = yield* nowIso;
               ctx.session = {
                 ...ctx.session,
@@ -624,27 +868,26 @@ export function makePiAdapter(
                 payload: ctx.currentModelId !== undefined ? { model: ctx.currentModelId } : {},
               });
             }
-            return { ctx, command, turnId, steering };
+            // Wait only for command acceptance. The full turn remains event-driven
+            // and completes at Pi's `agent_settled` boundary.
+            yield* ctx.runtime.request(command).pipe(
+              Effect.mapError(
+                (cause): ProviderAdapterError =>
+                  new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "prompt",
+                    detail: cause.message,
+                    cause,
+                  }),
+              ),
+              Effect.tapError((error) =>
+                error.message.includes("did not respond")
+                  ? stopSessionInternal(ctx)
+                  : settleTurn(ctx, "failed", error.message),
+              ),
+            );
+            return { ctx, turnId };
           }),
-        );
-
-        // Acceptance is awaited so a rejected prompt fails sendTurn directly;
-        // failures after acceptance arrive through the event stream instead.
-        yield* prepared.ctx.runtime.request(prepared.command).pipe(
-          Effect.mapError(
-            (cause): ProviderAdapterError =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "prompt",
-                detail: cause.message,
-                cause,
-              }),
-          ),
-          Effect.tapError((error) =>
-            withThreadLock(input.threadId, settleTurn(prepared.ctx, "failed", error.message)).pipe(
-              Effect.ignore,
-            ),
-          ),
         );
 
         const resumeCursor = prepared.ctx.session.resumeCursor;
@@ -666,8 +909,20 @@ export function makePiAdapter(
           const target = turnId ?? ctx.activeTurnId ?? ctx.session.activeTurnId;
           if (!target || !ctx.streaming) return;
           ctx.interruptedTurnIds.add(target);
-          // agent_settled follows the abort and settles the turn as cancelled.
-          yield* ctx.runtime.notify({ type: "abort" }).pipe(Effect.ignore);
+          // Pi continues queued steering after abort unless the queue is
+          // cleared first. agent_settled then settles the turn as cancelled.
+          yield* ctx.runtime.request({ type: "clear_queue" }, 1_000).pipe(Effect.ignore);
+          yield* ctx.runtime.request({ type: "abort" }).pipe(
+            Effect.mapError(
+              (cause): ProviderAdapterError =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "abort",
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
         }),
       );
 
