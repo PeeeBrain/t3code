@@ -3,9 +3,11 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   GROK_COST_USD_TICKS_PER_DOLLAR,
   initialCodexScanState,
+  initialPiScanState,
   parseClaudeLine,
   parseCodexLine,
   parseGrokLine,
+  parsePiLine,
   totalTokens,
 } from "./usageTranscripts.ts";
 
@@ -249,6 +251,129 @@ describe("totalTokens", () => {
         reasoningTokens: 25,
       }),
     ).toBe(100);
+  });
+});
+
+describe("parsePiLine", () => {
+  /** Shaped after a real Pi assistant entry (session format v3). */
+  function piAssistantLine(overrides?: { model?: string; input?: number; cacheRead?: number }) {
+    return JSON.stringify({
+      type: "message",
+      id: "c22334c8",
+      parentId: "aad95cc6",
+      timestamp: "2026-08-25T18:53:04.976Z",
+      message: {
+        role: "assistant",
+        provider: "opencode-go",
+        model: overrides?.model ?? "deepseek-v4-flash",
+        content: [{ type: "text", text: "hi" }],
+        usage: {
+          input: overrides?.input ?? 1392,
+          output: 185,
+          cacheRead: overrides?.cacheRead ?? 19968,
+          cacheWrite: 0,
+          reasoning: 0,
+          totalTokens: 21545,
+          cost: {
+            input: 0.0003,
+            output: 0.0001,
+            cacheRead: 0.00013,
+            cacheWrite: 0,
+            total: 0.00056,
+          },
+        },
+      },
+    });
+  }
+
+  it("maps pi usage fields, treating input as exclusive of cache tokens", () => {
+    const state = initialPiScanState();
+    const record = parsePiLine(piAssistantLine(), state);
+
+    expect(record).not.toBeNull();
+    expect(record?.provider).toBe("pi");
+    expect(record?.model).toBe("deepseek-v4-flash");
+    expect(record?.totals).toEqual({
+      uncachedInputTokens: 1392,
+      cachedInputTokens: 19968,
+      cacheCreationTokens: 0,
+      outputTokens: 185,
+      reasoningTokens: 0,
+    });
+    expect(record?.reportedCostUsd).toBeCloseTo(0.00056, 6);
+  });
+
+  it("captures the session id from the header line for dedupe keys", () => {
+    const state = initialPiScanState();
+    parsePiLine(
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "019f3cfc-87a2-7145-964b-73dda7bc5838",
+        timestamp: "2026-07-07T14:30:10.594Z",
+        cwd: "/tmp/project",
+      }),
+      state,
+    );
+    const record = parsePiLine(piAssistantLine(), state);
+
+    expect(record?.sessionId).toBe("019f3cfc-87a2-7145-964b-73dda7bc5838");
+    expect(record?.dedupeKey).toContain("019f3cfc-87a2-7145-964b-73dda7bc5838:c22334c8:");
+  });
+
+  it("ignores user messages and non-message entries", () => {
+    const state = initialPiScanState();
+    expect(
+      parsePiLine(
+        JSON.stringify({
+          type: "message",
+          id: "aad95cc6",
+          timestamp: "2026-08-25T18:52:40Z",
+          message: { role: "user", content: [{ type: "text", text: "go" }] },
+        }),
+        state,
+      ),
+    ).toBeNull();
+    expect(
+      parsePiLine(
+        JSON.stringify({
+          type: "model_change",
+          id: "35103f3a",
+          timestamp: "2026-08-25T18:52:41Z",
+          provider: "google",
+          modelId: "gemini-pro",
+        }),
+        state,
+      ),
+    ).toBeNull();
+  });
+
+  it("caps reasoning at output and skips zero-token entries", () => {
+    const state = initialPiScanState();
+    const reasoningHeavy = JSON.parse(piAssistantLine()) as Record<string, unknown>;
+    const message = reasoningHeavy["message"] as Record<string, unknown>;
+    message["usage"] = {
+      input: 5,
+      output: 3,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 99,
+      totalTokens: 8,
+      cost: { total: 0 },
+    };
+    const record = parsePiLine(JSON.stringify(reasoningHeavy), state);
+    expect(record?.totals.reasoningTokens).toBe(3);
+
+    const empty = JSON.parse(piAssistantLine()) as Record<string, unknown>;
+    (empty["message"] as Record<string, unknown>)["usage"] = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      totalTokens: 0,
+    };
+    expect(parsePiLine(JSON.stringify(empty), state)).toBeNull();
   });
 });
 

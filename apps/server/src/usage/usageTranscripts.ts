@@ -70,6 +70,10 @@ export function totalTokens(totals: UsageTokenTotals): number {
 export function mightCarryUsage(line: string, provider: UsageProviderKind): boolean {
   if (provider === "claude") return line.includes('"usage"');
   if (provider === "grok") return line.includes('"turn_completed"');
+  if (provider === "pi") {
+    // Session headers carry no usage but establish the scan state's session id.
+    return line.includes('"usage"') || line.includes('"type":"session"');
+  }
   return line.includes('"token_count"');
 }
 
@@ -486,3 +490,97 @@ export function parseGrokLine(line: string): readonly UsageRecord[] {
 }
 
 export { EMPTY_TOTALS };
+
+/* -------------------------------------------------------------------------- */
+/* Pi                                                                         */
+/* -------------------------------------------------------------------------- */
+
+/** Rolling state for one Pi session file. */
+export interface PiScanState {
+  /** From the leading `{"type":"session"}` header line. */
+  sessionId: string;
+}
+
+export function initialPiScanState(): PiScanState {
+  return { sessionId: "" };
+}
+
+/**
+ * Feeds one line of a Pi session JSONL into `state`, returning a record when
+ * the line was an assistant message carrying usage.
+ *
+ * Pi writes one entry per assistant message with a complete cumulative usage
+ * object (`input` excludes cache tokens there; `totalTokens` is the sum), so
+ * entries are unique per file and only cross-file fork copies need deduping,
+ * which `dedupeKey` covers via session + entry id.
+ */
+export function parsePiLine(line: string, state: PiScanState): UsageRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+
+  const record = parsed as Record<string, unknown>;
+  if (record["type"] === "session") {
+    if (typeof record["id"] === "string") state.sessionId = record["id"];
+    return null;
+  }
+  if (record["type"] !== "message") return null;
+
+  const message = record["message"];
+  if (typeof message !== "object" || message === null) return null;
+  const messageRecord = message as Record<string, unknown>;
+  if (messageRecord["role"] !== "assistant") return null;
+
+  const usage = messageRecord["usage"];
+  if (typeof usage !== "object" || usage === null) return null;
+  const usageRecord = usage as Record<string, unknown>;
+
+  const timestampMs = parseTimestampMs(record["timestamp"]);
+  if (timestampMs === null) return null;
+
+  const model = typeof messageRecord["model"] === "string" ? messageRecord["model"] : "";
+  if (model.length === 0) return null;
+
+  const inputTokens = int(usageRecord["input"]);
+  const cachedInputTokens = int(usageRecord["cacheRead"]);
+  const cacheCreationTokens = int(usageRecord["cacheWrite"]);
+  const outputTokens = int(usageRecord["output"]);
+
+  const totals: UsageTokenTotals = {
+    // Pi reports `input` exclusive of cache tokens, unlike Codex.
+    uncachedInputTokens: inputTokens,
+    cachedInputTokens,
+    cacheCreationTokens,
+    outputTokens,
+    // Reported separately and already included in output_tokens.
+    reasoningTokens: Math.min(outputTokens, int(usageRecord["reasoning"])),
+  };
+
+  if (totalTokens(totals) === 0) return null;
+
+  const cost = usageRecord["cost"];
+  const reportedCostUsd =
+    typeof cost === "object" && cost !== null && !Array.isArray(cost)
+      ? (() => {
+          const total = (cost as Record<string, unknown>)["total"];
+          return typeof total === "number" && Number.isFinite(total) ? total : null;
+        })()
+      : null;
+
+  const messageId = typeof record["id"] === "string" ? record["id"] : "";
+
+  return {
+    provider: "pi",
+    timestampMs,
+    model,
+    sessionId: state.sessionId,
+    totals,
+    reportedCostUsd,
+    dedupeKey:
+      state.sessionId && messageId ? `${state.sessionId}:${messageId}:${timestampMs}` : null,
+  };
+}

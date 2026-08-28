@@ -67,6 +67,7 @@ import {
 import { resolveProviderOptionDescriptors } from "../../lib/providerOptions";
 import { useComposerPathSearch } from "../../state/use-composer-path-search";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
+import { formatComposerSkillInsertion } from "./composerSkillCommand";
 import { matchesSlashSkillQuery } from "./composerSlashSkillSearch";
 import {
   type ExistingThreadSettingsRouteSession,
@@ -437,7 +438,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
           id: `skill:${skill.name}`,
           type: "skill" as const,
           skill,
-          label: `skill:${skill.name}`,
+          label:
+            selectedProviderStatus?.driver === "pi" ? `/skill:${skill.name}` : `$${skill.name}`,
           description: skill.shortDescription ?? skill.description ?? "",
         }));
 
@@ -599,7 +601,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       if (item.type === "path") {
         replacement = `${serializeComposerFileLink(item.path)} `;
       } else if (item.type === "skill") {
-        replacement = `$${item.skill.name} `;
+        replacement = formatComposerSkillInsertion({
+          providerDriver: selectedProviderStatus?.driver,
+          skillName: item.skill.name,
+        });
       } else if (item.type === "slash-command") {
         replacement = `/${item.command} `;
       } else if (item.type === "provider-slash-command") {
@@ -615,7 +620,13 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       setComposerSelection({ start: result.cursor, end: result.cursor });
       onChangeDraftMessage(result.text);
     },
-    [composerTrigger, draftMessage, onChangeDraftMessage, onUpdateInteractionMode],
+    [
+      composerTrigger,
+      draftMessage,
+      onChangeDraftMessage,
+      onUpdateInteractionMode,
+      selectedProviderStatus?.driver,
+    ],
   );
 
   // ── Model menu ───────────────────────────────────────────

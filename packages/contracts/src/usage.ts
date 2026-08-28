@@ -26,13 +26,13 @@ export const USAGE_CONTRACT_VERSION = 5 as const;
 /**
  * Oldest {@link UsageSummary} version a current client will still merge.
  *
- * v5 only adds `grok` to {@link UsageProviderKind}; v4 Claude/Codex buckets
+ * v5 only adds `grok` and `pi` to {@link UsageProviderKind}; v4 Claude/Codex buckets
  * remain valid, so mixed-version environments keep those totals instead of
  * treating every older server as stale.
  */
 export const USAGE_MERGE_COMPATIBLE_SINCE = 4 as const;
 
-export const UsageProviderKind = Schema.Literals(["claude", "codex", "grok"]);
+export const UsageProviderKind = Schema.Literals(["claude", "codex", "grok", "pi"]);
 export type UsageProviderKind = typeof UsageProviderKind.Type;
 
 /**

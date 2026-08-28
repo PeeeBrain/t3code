@@ -214,6 +214,23 @@ export const GrokIcon: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+/** Official Pi CLI mark (pixel-art π), theme-adaptive like the other logos. */
+export const PiIcon: Icon = ({ className, ...props }) => (
+  <svg
+    {...props}
+    viewBox="0 0 800 800"
+    fill="none"
+    className={cn("fill-[#0F0F0F] dark:fill-[#F5F5F5]", className)}
+  >
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
+    />
+    <path d="M517.36 400H634.72V634.72H517.36Z" />
+  </svg>
+);
+
 export const TraeIcon: Icon = (props) => (
   <svg {...props} viewBox="0 0 24 24" fill="currentColor">
     {/* Back rectangle: left strip + bottom strip drawn separately — empty bottom-left corner is the gap between them */}
