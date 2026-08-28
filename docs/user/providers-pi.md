@@ -22,21 +22,20 @@ by their `provider/model` identifier. A model is available when Pi can resolve i
 credentials. Models from providers that are not configured or authenticated should not appear in the
 Pi model picker.
 
-Models that Pi marks as reasoning-capable show a **Reasoning** selector with exactly the levels Pi
-maps for that model (from `thinkingLevelMap` on Pi's model objects) — for example Low, High, and Max
-on models that support them. The selected level is applied with `set_thinking_level` before the
-turn. When Pi's own default level is unsupported for a model, T3 falls back to the highest level the
-model does support.
+Models that Pi marks as reasoning-capable show a **Reasoning** selector. **Pi default** keeps the
+level configured by Pi and does not overwrite it. Explicit levels are checked against Pi's
+session-scoped available-level query before T3 applies them. Pi's model map can disable a level with
+`null`; omitted standard levels through High keep Pi's default mapping, while XHigh and Max require
+explicit support.
 
 One Pi card in T3 Code represents one Pi CLI setup. That setup can expose models from several Pi
 providers, so the number of Pi cards is not the number of model providers in Pi.
 
-The provider card reports the number of upstream providers represented by Pi's available model
-list, intersected with the providers configured in Pi's credential store (`auth.json`). Providers
-that only have an ambient environment token (for example `ANTHROPIC_AUTH_TOKEN`) are not counted
-and their models stay out of the picker. If the filtered list is empty, T3 reports Pi as
-unauthenticated because RPC cannot distinguish missing credentials from a configured provider that
-currently exposes no models.
+The provider card reports the number of upstream providers Pi says are ready. Readiness checks run
+with that Pi provider instance's environment, so credentials injected through environment variables
+work without a matching global credential-file entry. If a readiness check cannot complete, T3
+keeps the affected models visible and reports authentication status as unknown instead of removing
+models that may still work.
 
 ## Commands and skills
 
@@ -52,14 +51,15 @@ Pi's built-in interactive TUI commands are not part of its RPC command list. A c
 guide](https://pi.dev/docs/latest/skills) for discovery locations and command names.
 
 User-level commands and skills are available in every project. Project-level Pi commands are
-working-directory-specific; until command inventory is refreshed per thread, a newly opened project
-may require a provider-status refresh before its project-local entries appear.
+working-directory-specific. T3 runs discovery from the server workspace root, matching the working
+directory used when that environment starts Pi.
 
-## Current limitations
+## Extension prompts and current limitations
 
-Pi support is still being completed. Model discovery, authentication reporting, and command
-discovery depend on the Pi process that T3 Code starts. If that process cannot return its available
-models or commands, T3 Code cannot safely infer them from Pi's full built-in catalog.
+Pi extensions can ask selection, confirmation, text, and editor questions. T3 shows those prompts in
+the chat composer on web, desktop, and mobile, then returns the answer to the extension. Extension
+notifications and failures appear in thread activity.
 
-Custom model entries are a local fallback, not proof that Pi can use those models. Verify the model
-in Pi before adding it to T3 Code settings.
+Model discovery, authentication reporting, and command discovery depend on the Pi process that T3
+Code starts. Custom model entries remain a local fallback, not proof that Pi can use those models.
+Verify a custom model in Pi before adding it to T3 Code settings.

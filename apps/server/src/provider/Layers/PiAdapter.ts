@@ -40,16 +40,31 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import type { ProviderAdapterShape, ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
+import { makePiRpcClient, type PiRpcClient } from "./PiRpcClient.ts";
 import {
-  makePiRpcSessionRuntime,
+  PI_DEFAULT_THINKING_LEVEL,
+  piForkMessagesFromData,
   piModelFromState,
+  piSessionIdFromState,
   piThinkingLevelFromState,
-  type PiRpcSessionRuntime,
-} from "./PiRpcSessionRuntime.ts";
+  piThinkingLevelsFromData,
+  type PiEvent,
+  type PiThinkingLevel,
+} from "./PiRpcProtocol.ts";
+import {
+  beginPiTurn,
+  cancelPendingExtensionDialogs,
+  initialPiTranslationState,
+  markTurnInterrupted,
+  piSettleTurn,
+  reducePiEvent,
+  resolvePiExtensionDialog,
+  type PiTranslationDeps,
+  type PiTranslationState,
+} from "./PiEventTranslation.ts";
 
 const PROVIDER = ProviderDriverKind.make("pi");
 const PI_RESUME_VERSION = 1 as const;
-const PI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 export interface PiAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
@@ -60,21 +75,24 @@ export interface PiAdapterLiveOptions {
 interface PiSessionContext {
   readonly threadId: ThreadId;
   /** The `--session-id` handed to the CLI; also the resume cursor payload. */
-  readonly piSessionId: string;
-  readonly runtime: PiRpcSessionRuntime;
+  piSessionId: string;
+  readonly runtime: PiRpcClient;
   session: ProviderSession;
   readonly scope: Scope.Closeable;
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   exitFiber: Fiber.Fiber<void, never> | undefined;
-  activeTurnId: TurnId | undefined;
-  assistantItemId: RuntimeItemId | undefined;
-  pendingFailureMessage: string | undefined;
-  /** Turns aborted locally whose `agent_settled` must land as cancelled. */
-  readonly interruptedTurnIds: Set<TurnId>;
-  streaming: boolean;
+  translation: PiTranslationState;
   currentModelId: string | undefined;
-  currentThinkingLevel: string | undefined;
-  turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  currentThinkingLevel: PiThinkingLevel | undefined;
+  /** Levels the current model supports, from `get_available_thinking_levels`. */
+  availableThinkingLevels: ReadonlyArray<PiThinkingLevel>;
+  /**
+   * Pi user messages sent per T3 turn for turns started by this process
+   * (1 + steering messages). Turns from before the process started are
+   * assumed to carry exactly one user message; rollback targets the first
+   * user message of the turn being rolled back to via Pi's `fork`.
+   */
+  userMessagesPerTurn: number[];
   stopped: boolean;
 }
 
@@ -88,79 +106,10 @@ function parsePiResume(raw: unknown): { sessionId: string } | undefined {
   return { sessionId: raw.sessionId.trim() };
 }
 
-/** Maps pi tool names onto T3's canonical item types; unknown names degrade gracefully. */
-function itemTypeFromPiToolName(
-  toolName: string,
-): "command_execution" | "file_change" | "mcp_tool_call" | "dynamic_tool_call" {
-  switch (toolName) {
-    case "bash":
-      return "command_execution";
-    case "write":
-    case "edit":
-      return "file_change";
-    default:
-      return toolName.startsWith("mcp") ? "mcp_tool_call" : "dynamic_tool_call";
-  }
-}
-
-/** Extracts `{toolCallId, toolName}` from a `tool_execution_*` event. */
-function piToolCallFromEvent(
-  value: Record<string, unknown>,
-): { readonly toolCallId: string; readonly toolName: string } | undefined {
-  const toolCallId = value["toolCallId"];
-  const toolName = value["toolName"];
-  if (typeof toolCallId !== "string" || typeof toolName !== "string") return undefined;
-  return { toolCallId, toolName };
-}
-
 function piModelParts(model: string): { provider: string; modelId: string } | undefined {
   const separator = model.indexOf("/");
   if (separator <= 0 || separator === model.length - 1) return undefined;
   return { provider: model.slice(0, separator), modelId: model.slice(separator + 1) };
-}
-
-/** Extracts `{kind, delta}` from a `message_update` carrying a text/thinking delta. */
-function piContentDelta(
-  value: Record<string, unknown>,
-): { readonly kind: "assistant_text" | "reasoning_text"; readonly delta: string } | undefined {
-  const event = value["assistantMessageEvent"];
-  if (!isRecord(event)) return undefined;
-  const eventType = event["type"];
-  if (eventType !== "text_delta" && eventType !== "thinking_delta") return undefined;
-  if (typeof event["delta"] !== "string" || event["delta"].length === 0) return undefined;
-  return {
-    kind: eventType === "text_delta" ? "assistant_text" : "reasoning_text",
-    delta: event["delta"],
-  };
-}
-
-/**
- * Token usage from a `message_update`. Pi reports cumulative usage on every
- * update; fields are optional so partial provider reporting round-trips.
- */
-function piUsageFromUpdate(value: Record<string, unknown>) {
-  const usage = value["usage"];
-  if (!isRecord(usage)) return undefined;
-  const int = (input: unknown): number | undefined =>
-    typeof input === "number" && Number.isFinite(input) && input >= 0
-      ? Math.trunc(input)
-      : undefined;
-  const input = int(usage["input"]);
-  const output = int(usage["output"]);
-  const totalTokens = int(usage["totalTokens"]);
-  const cachedInputTokens = int(usage["cacheRead"]);
-  const reasoning = int(usage["reasoning"]);
-  if (input === undefined && output === undefined && totalTokens === undefined) return undefined;
-  return {
-    usedTokens: totalTokens ?? 0,
-    lastUsedTokens: totalTokens ?? 0,
-    inputTokens: input ?? 0,
-    lastInputTokens: input ?? 0,
-    cachedInputTokens: cachedInputTokens ?? 0,
-    outputTokens: output ?? 0,
-    lastOutputTokens: output ?? 0,
-    reasoningOutputTokens: reasoning ?? 0,
-  };
 }
 
 export function makePiAdapter(
@@ -192,6 +141,11 @@ export function makePiAdapter(
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(Effect.orDie);
     const nextEventId = Effect.map(randomUUIDv4, (id) => EventId.make(id));
     const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
+
+    const translationDeps: PiTranslationDeps = {
+      stamp: makeEventStamp,
+      newItemId: () => Effect.map(randomUUIDv4, (id) => RuntimeItemId.make(id)),
+    };
 
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
@@ -227,248 +181,71 @@ export function makePiAdapter(
       return Effect.succeed(ctx);
     };
 
-    const settleTurn = (
-      ctx: PiSessionContext,
-      state: "completed" | "cancelled" | "failed",
-      errorMessage?: string,
-    ) =>
+    const markSessionReady = (ctx: PiSessionContext) =>
       Effect.gen(function* () {
-        const turnId = ctx.activeTurnId ?? ctx.session.activeTurnId;
-        ctx.streaming = false;
-        ctx.activeTurnId = undefined;
-        ctx.assistantItemId = undefined;
-        ctx.pendingFailureMessage = undefined;
         const updatedAt = yield* nowIso;
         const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
         ctx.session = { ...readySession, status: "ready", updatedAt };
-        if (!turnId) return;
-        if (state === "failed") {
-          yield* offerRuntimeEvent({
-            type: "turn.completed",
-            ...(yield* makeEventStamp()),
-            provider: PROVIDER,
-            threadId: ctx.threadId,
-            turnId,
-            payload: { state: "failed", errorMessage: errorMessage ?? "Pi turn failed." },
-          });
-          return;
-        }
-        yield* offerRuntimeEvent({
-          type: "turn.completed",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          turnId,
-          payload: { state },
-        });
       });
 
-    /** Translates one decoded pi RPC line into runtime events. Unknown lines are ignored. */
-    const translateEvent = (ctx: PiSessionContext, value: Record<string, unknown>) =>
+    /** Applies a Pi event through the pure reducer and settles the session on turn completion. */
+    const ingestPiEvent = (ctx: PiSessionContext, event: PiEvent) =>
       Effect.gen(function* () {
-        const eventType = value["type"];
-        // Turn completion. agent_end alone is not enough: retries, compaction
-        // retries and queued follow-ups may continue past it.
-        if (eventType === "agent_settled") {
-          const wasInterrupted =
-            ctx.activeTurnId !== undefined && ctx.interruptedTurnIds.has(ctx.activeTurnId);
-          if (ctx.activeTurnId !== undefined) ctx.interruptedTurnIds.delete(ctx.activeTurnId);
-          const failureMessage = ctx.pendingFailureMessage;
-          yield* settleTurn(
-            ctx,
-            wasInterrupted ? "cancelled" : failureMessage ? "failed" : "completed",
-            failureMessage,
+        const result = yield* reducePiEvent(
+          ctx.translation,
+          event,
+          { provider: PROVIDER, threadId: ctx.threadId },
+          translationDeps,
+        );
+        ctx.translation = result.state;
+        yield* Effect.forEach(result.events, offerRuntimeEvent, { discard: true });
+        if (result.turnSettled !== undefined) yield* markSessionReady(ctx);
+      });
+
+    /** Cancels open extension dialogs and pushes the cancellation responses to Pi. */
+    const cancelDialogs = (ctx: PiSessionContext, sendResponses: boolean) =>
+      Effect.gen(function* () {
+        const result = yield* cancelPendingExtensionDialogs(
+          ctx.translation,
+          { provider: PROVIDER, threadId: ctx.threadId },
+          translationDeps,
+        );
+        ctx.translation = result.state;
+        yield* Effect.forEach(result.events, offerRuntimeEvent, { discard: true });
+        if (sendResponses) {
+          yield* Effect.forEach(
+            result.responses,
+            (response) => Effect.ignore(ctx.runtime.notify(response)),
+            { discard: true },
           );
-          return;
         }
-        if (eventType === "agent_start") {
-          ctx.streaming = true;
-          return;
-        }
-        if (eventType === "message_start") {
-          const message = value["message"];
-          if (!ctx.activeTurnId || !isRecord(message) || message["role"] !== "assistant") return;
-          ctx.assistantItemId = RuntimeItemId.make(yield* randomUUIDv4);
-          yield* offerRuntimeEvent({
-            type: "item.started",
-            ...(yield* makeEventStamp()),
-            provider: PROVIDER,
-            threadId: ctx.threadId,
-            turnId: ctx.activeTurnId,
-            itemId: ctx.assistantItemId,
-            payload: { itemType: "assistant_message", status: "inProgress" },
-          });
-          return;
-        }
-        if (eventType === "message_update") {
-          const delta = piContentDelta(value);
-          if (delta) {
-            if (!ctx.assistantItemId && ctx.activeTurnId) {
-              ctx.assistantItemId = RuntimeItemId.make(yield* randomUUIDv4);
-              yield* offerRuntimeEvent({
-                type: "item.started",
-                ...(yield* makeEventStamp()),
-                provider: PROVIDER,
-                threadId: ctx.threadId,
-                turnId: ctx.activeTurnId,
-                itemId: ctx.assistantItemId,
-                payload: { itemType: "assistant_message", status: "inProgress" },
-              });
-            }
-            yield* offerRuntimeEvent({
-              type: "content.delta",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: ctx.threadId,
-              ...(ctx.activeTurnId ? { turnId: ctx.activeTurnId } : {}),
-              ...(ctx.assistantItemId ? { itemId: ctx.assistantItemId } : {}),
-              payload: { streamKind: delta.kind, delta: delta.delta },
-              raw: { source: "pi.rpc", messageType: "message_update", payload: value },
-            });
-          }
-          const usage = piUsageFromUpdate(value);
-          if (usage && ctx.activeTurnId) {
-            yield* offerRuntimeEvent({
-              type: "thread.token-usage.updated",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: ctx.threadId,
-              ...(ctx.activeTurnId ? { turnId: ctx.activeTurnId } : {}),
-              payload: { usage },
-            });
-          }
-          return;
-        }
-        if (eventType === "message_end") {
-          const message = value["message"];
-          if (!isRecord(message) || message["role"] !== "assistant") return;
-          const turnId = ctx.activeTurnId;
-          if (turnId) {
-            let itemId = ctx.assistantItemId;
-            if (!itemId) {
-              itemId = RuntimeItemId.make(
-                typeof message["id"] === "string" ? message["id"] : yield* randomUUIDv4,
-              );
-              ctx.assistantItemId = itemId;
-              yield* offerRuntimeEvent({
-                type: "item.started",
-                ...(yield* makeEventStamp()),
-                provider: PROVIDER,
-                threadId: ctx.threadId,
-                turnId,
-                itemId,
-                payload: { itemType: "assistant_message", status: "inProgress" },
-              });
-            }
-            const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
-            if (turnRecord) turnRecord.items.push(message);
-            const stopReason = message["stopReason"];
-            const errorMessage = message["errorMessage"];
-            if (stopReason === "error") {
-              ctx.pendingFailureMessage =
-                typeof errorMessage === "string" && errorMessage.trim()
-                  ? errorMessage.trim()
-                  : "Pi assistant response failed.";
-            }
-            yield* offerRuntimeEvent({
-              type: "item.completed",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: ctx.threadId,
-              turnId,
-              itemId,
-              payload: {
-                itemType: "assistant_message",
-                status: stopReason === "error" ? "failed" : "completed",
-              },
-              raw: { source: "pi.rpc", messageType: "message_end", payload: value },
-            });
-            ctx.assistantItemId = undefined;
-          }
-          return;
-        }
-        if (
-          eventType === "tool_execution_start" ||
-          eventType === "tool_execution_update" ||
-          eventType === "tool_execution_end"
-        ) {
-          const call = piToolCallFromEvent(value);
-          if (!call || !ctx.activeTurnId) return;
-          const itemType = itemTypeFromPiToolName(call.toolName);
-          const isError = eventType === "tool_execution_end" && value["isError"] === true;
-          const data = {
-            toolName: call.toolName,
-            ...(isRecord(value["args"]) ? { input: value["args"] } : {}),
-            ...(value["partialResult"] !== undefined
-              ? { partialResult: value["partialResult"] }
-              : {}),
-            ...(value["result"] !== undefined ? { result: value["result"] } : {}),
-          };
-          yield* offerRuntimeEvent({
-            type:
-              eventType === "tool_execution_start"
-                ? "item.started"
-                : eventType === "tool_execution_end"
-                  ? "item.completed"
-                  : "item.updated",
-            ...(yield* makeEventStamp()),
-            provider: PROVIDER,
-            threadId: ctx.threadId,
-            turnId: ctx.activeTurnId,
-            itemId: RuntimeItemId.make(call.toolCallId),
-            payload: {
-              itemType,
-              status:
-                eventType === "tool_execution_end"
-                  ? isError
-                    ? ("failed" as const)
-                    : ("completed" as const)
-                  : ("inProgress" as const),
-              title: call.toolName,
-              data,
-            },
-            raw: { source: "pi.rpc", messageType: eventType, payload: value },
-          });
-          return;
-        }
-        if (eventType === "auto_retry_start") {
-          ctx.pendingFailureMessage = undefined;
-          yield* offerRuntimeEvent({
-            type: "session.state.changed",
-            ...(yield* makeEventStamp()),
-            provider: PROVIDER,
-            threadId: ctx.threadId,
-            payload: { state: "running", reason: "Pi auto-retry started" },
-          });
-          return;
-        }
-        if (eventType === "auto_retry_end") {
-          if (value["success"] === true) {
-            ctx.pendingFailureMessage = undefined;
-          } else if (value["success"] === false) {
-            ctx.pendingFailureMessage =
-              typeof value["finalError"] === "string" && value["finalError"].trim()
-                ? value["finalError"].trim()
-                : "Pi exhausted its automatic retries.";
-          }
-          return;
-        }
-        if (
-          eventType === "compaction_end" &&
-          value["aborted"] !== true &&
-          value["willRetry"] !== true &&
-          typeof value["errorMessage"] === "string" &&
-          value["errorMessage"].trim()
-        ) {
-          ctx.pendingFailureMessage = value["errorMessage"].trim();
-        }
+      });
+
+    /** Force-settles an active turn outside the event stream (stop, process exit). */
+    const forceSettleTurn = (
+      ctx: PiSessionContext,
+      outcome: "cancelled" | "failed",
+      errorMessage?: string,
+    ) =>
+      Effect.gen(function* () {
+        const result = yield* piSettleTurn(
+          ctx.translation,
+          outcome,
+          { provider: PROVIDER, threadId: ctx.threadId },
+          translationDeps,
+          errorMessage,
+        );
+        ctx.translation = result.state;
+        yield* Effect.forEach(result.events, offerRuntimeEvent, { discard: true });
+        if (result.turnSettled !== undefined) yield* markSessionReady(ctx);
       });
 
     const stopSessionInternal = (ctx: PiSessionContext) =>
       Effect.gen(function* () {
         if (ctx.stopped) return;
-        if (ctx.streaming) yield* settleTurn(ctx, "cancelled");
+        if (ctx.translation.streaming) yield* forceSettleTurn(ctx, "cancelled");
         ctx.stopped = true;
+        yield* cancelDialogs(ctx, true);
         yield* Effect.ignore(ctx.runtime.notify({ type: "abort" }));
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber).pipe(Effect.ignore);
@@ -482,6 +259,82 @@ export function makePiAdapter(
           threadId: ctx.threadId,
           payload: { exitKind: "graceful" },
         });
+      });
+
+    /**
+     * Applies an explicit reasoning-effort selection, or deliberately leaves
+     * Pi's configured level alone for the `default` sentinel.
+     */
+    const applyThinkingLevel = (
+      ctx: PiSessionContext,
+      requestedThinkingLevel: string | undefined,
+      operation: "startSession" | "sendTurn",
+    ): Effect.Effect<void, ProviderAdapterError> =>
+      Effect.gen(function* () {
+        if (
+          requestedThinkingLevel === undefined ||
+          requestedThinkingLevel === PI_DEFAULT_THINKING_LEVEL
+        ) {
+          return;
+        }
+        const level = ctx.availableThinkingLevels.find(
+          (candidate) => candidate === requestedThinkingLevel,
+        );
+        if (level === undefined) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation,
+            issue: `Pi model '${ctx.currentModelId ?? "unknown"}' does not support reasoning level '${requestedThinkingLevel}'. Available: ${ctx.availableThinkingLevels.join(", ") || "none"}.`,
+          });
+        }
+        if (level === ctx.currentThinkingLevel) return;
+        yield* ctx.runtime.request({ type: "set_thinking_level", level }).pipe(
+          Effect.mapError(
+            (cause): ProviderAdapterError =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "set_thinking_level",
+                detail: cause.message,
+                cause,
+              }),
+          ),
+        );
+        ctx.currentThinkingLevel = level;
+      });
+
+    /** Refreshes model, thinking level, and per-model level availability from the session. */
+    const syncSessionModelState = (
+      ctx: PiSessionContext,
+    ): Effect.Effect<Record<string, unknown>, ProviderAdapterError> =>
+      Effect.gen(function* () {
+        const stateData = yield* ctx.runtime.request({ type: "get_state" }).pipe(
+          Effect.mapError(
+            (cause): ProviderAdapterError =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "get_state",
+                detail: cause.message,
+                cause,
+              }),
+          ),
+        );
+        ctx.currentModelId = piModelFromState(stateData) ?? ctx.currentModelId;
+        ctx.currentThinkingLevel = piThinkingLevelFromState(stateData);
+        const levelsData = yield* ctx.runtime
+          .request({ type: "get_available_thinking_levels" })
+          .pipe(
+            Effect.mapError(
+              (cause): ProviderAdapterError =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "get_available_thinking_levels",
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+        ctx.availableThinkingLevels = piThinkingLevelsFromData(levelsData);
+        return stateData;
       });
 
     const startSession: ProviderAdapterShape<ProviderAdapterError>["startSession"] = (input) =>
@@ -522,12 +375,15 @@ export function makePiAdapter(
             sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
           );
 
-          const runtime = yield* makePiRpcSessionRuntime({
+          const runtime = yield* makePiRpcClient({
             settings: piSettings,
             ...(options?.environment ? { environment: options.environment } : {}),
             cwd,
-            sessionId: piSessionId,
-            ...(modelSelection?.model ? { modelId: modelSelection.model } : {}),
+            address: {
+              kind: "session",
+              sessionId: piSessionId,
+              ...(modelSelection?.model ? { modelId: modelSelection.model } : {}),
+            },
             ...(options?.requestTimeoutMs ? { requestTimeoutMs: options.requestTimeoutMs } : {}),
           }).pipe(
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
@@ -556,26 +412,21 @@ export function makePiAdapter(
             scope: sessionScope,
             notificationFiber: undefined,
             exitFiber: undefined,
-            activeTurnId: undefined,
-            assistantItemId: undefined,
-            pendingFailureMessage: undefined,
-            interruptedTurnIds: new Set(),
-            streaming: false,
+            translation: initialPiTranslationState(),
             currentModelId: modelSelection?.model,
             currentThinkingLevel: undefined,
-            turns: [],
+            availableThinkingLevels: [],
+            userMessagesPerTurn: [],
             stopped: false,
           };
           // Pump first, then start: pi emits events (extension UI prompts)
           // before any command response arrives.
           ctx.notificationFiber = yield* Stream.runForEach(runtime.events, (event) =>
-            isRecord(event)
-              ? translateEvent(ctx, event).pipe(
-                  Effect.catchCause((cause) =>
-                    Effect.logWarning("Failed to process Pi runtime event.", { cause }),
-                  ),
-                )
-              : Effect.void,
+            ingestPiEvent(ctx, event).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Failed to process Pi runtime event.", { cause }),
+              ),
+            ),
           ).pipe(
             Effect.catchCause((cause) =>
               Effect.logError("Failed to process Pi runtime notifications.", { cause }),
@@ -595,46 +446,12 @@ export function makePiAdapter(
             ),
           );
 
-          const stateData = yield* runtime.request({ type: "get_state" }).pipe(
-            Effect.mapError(
-              (cause): ProviderAdapterRequestError =>
-                new ProviderAdapterRequestError({
-                  provider: PROVIDER,
-                  method: "get_state",
-                  detail: cause.message,
-                  cause,
-                }),
-            ),
+          yield* syncSessionModelState(ctx);
+          yield* applyThinkingLevel(
+            ctx,
+            getModelSelectionStringOptionValue(modelSelection, "reasoningEffort"),
+            "startSession",
           );
-          ctx.currentModelId = piModelFromState(stateData) ?? ctx.currentModelId;
-          ctx.currentThinkingLevel = piThinkingLevelFromState(stateData);
-          const requestedThinkingLevel = getModelSelectionStringOptionValue(
-            modelSelection,
-            "reasoningEffort",
-          );
-          if (requestedThinkingLevel && !PI_THINKING_LEVELS.has(requestedThinkingLevel)) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "startSession",
-              issue: `Unsupported Pi reasoning level '${requestedThinkingLevel}'.`,
-            });
-          }
-          if (requestedThinkingLevel && requestedThinkingLevel !== ctx.currentThinkingLevel) {
-            yield* runtime
-              .request({ type: "set_thinking_level", level: requestedThinkingLevel })
-              .pipe(
-                Effect.mapError(
-                  (cause): ProviderAdapterRequestError =>
-                    new ProviderAdapterRequestError({
-                      provider: PROVIDER,
-                      method: "set_thinking_level",
-                      detail: cause.message,
-                      cause,
-                    }),
-                ),
-              );
-            ctx.currentThinkingLevel = requestedThinkingLevel;
-          }
 
           const readySession: ProviderSession = {
             ...ctx.session,
@@ -653,7 +470,7 @@ export function makePiAdapter(
                 Effect.gen(function* () {
                   if (ctx.stopped) return;
                   const reason = `Pi CLI exited unexpectedly with code ${exitCode}.`;
-                  if (ctx.streaming) yield* settleTurn(ctx, "failed", reason);
+                  if (ctx.translation.streaming) yield* forceSettleTurn(ctx, "failed", reason);
                   ctx.stopped = true;
                   ctx.session = {
                     ...ctx.session,
@@ -661,6 +478,7 @@ export function makePiAdapter(
                     updatedAt: yield* nowIso,
                   };
                   sessions.delete(input.threadId);
+                  yield* cancelDialogs(ctx, false);
                   yield* offerRuntimeEvent({
                     type: "session.state.changed",
                     ...(yield* makeEventStamp()),
@@ -718,15 +536,18 @@ export function makePiAdapter(
             // A sendTurn while pi is streaming is a steer folded into the
             // running turn, mirroring the merged-turn behaviour of the other
             // adapters; only the last queued message settles the turn.
-            const steering = ctx.streaming && ctx.activeTurnId !== undefined;
-            const turnId = steering
-              ? (ctx.activeTurnId as TurnId)
-              : TurnId.make(yield* randomUUIDv4);
+            const activeTurnId = ctx.translation.activeTurnId;
+            const steering = ctx.translation.streaming && activeTurnId !== undefined;
+            const turnId =
+              steering && activeTurnId !== undefined
+                ? activeTurnId
+                : TurnId.make(yield* randomUUIDv4);
 
-            const selectedModel =
+            const selection =
               input.modelSelection?.instanceId === boundInstanceId
-                ? input.modelSelection.model.trim()
+                ? input.modelSelection
                 : undefined;
+            const selectedModel = selection?.model.trim();
             if (!steering && selectedModel && selectedModel !== ctx.currentModelId) {
               const model = piModelParts(selectedModel);
               if (!model) {
@@ -749,45 +570,19 @@ export function makePiAdapter(
                       }),
                   ),
                 );
+              // Thinking levels are model-scoped; re-read them plus the
+              // session's effective model state after the switch.
+              yield* syncSessionModelState(ctx);
               ctx.currentModelId = selectedModel;
-              ctx.currentThinkingLevel = undefined;
               ctx.session = { ...ctx.session, model: selectedModel, updatedAt: yield* nowIso };
             }
 
             const selectedThinkingLevel =
-              input.modelSelection?.instanceId === boundInstanceId
-                ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
+              selection !== undefined
+                ? getModelSelectionStringOptionValue(selection, "reasoningEffort")
                 : undefined;
-            if (
-              !steering &&
-              selectedThinkingLevel &&
-              !PI_THINKING_LEVELS.has(selectedThinkingLevel)
-            ) {
-              return yield* new ProviderAdapterValidationError({
-                provider: PROVIDER,
-                operation: "sendTurn",
-                issue: `Unsupported Pi reasoning level '${selectedThinkingLevel}'.`,
-              });
-            }
-            if (
-              !steering &&
-              selectedThinkingLevel &&
-              selectedThinkingLevel !== ctx.currentThinkingLevel
-            ) {
-              yield* ctx.runtime
-                .request({ type: "set_thinking_level", level: selectedThinkingLevel })
-                .pipe(
-                  Effect.mapError(
-                    (cause): ProviderAdapterError =>
-                      new ProviderAdapterRequestError({
-                        provider: PROVIDER,
-                        method: "set_thinking_level",
-                        detail: cause.message,
-                        cause,
-                      }),
-                  ),
-                );
-              ctx.currentThinkingLevel = selectedThinkingLevel;
+            if (!steering) {
+              yield* applyThinkingLevel(ctx, selectedThinkingLevel, "sendTurn");
             }
 
             const images = yield* Effect.forEach(
@@ -838,18 +633,16 @@ export function makePiAdapter(
               });
             }
 
-            const command: Record<string, unknown> = {
-              type: "prompt",
+            const command = {
+              type: "prompt" as const,
               message: text ?? "",
-              ...(steering ? { streamingBehavior: "steer" } : {}),
+              ...(steering ? { streamingBehavior: "steer" as const } : {}),
               ...(images.length > 0 ? { images } : {}),
             };
 
             if (!steering) {
-              ctx.activeTurnId = turnId;
-              ctx.streaming = true;
-              ctx.assistantItemId = undefined;
-              ctx.pendingFailureMessage = undefined;
+              ctx.translation = beginPiTurn(ctx.translation, turnId);
+              ctx.userMessagesPerTurn.push(1);
               const updatedAt = yield* nowIso;
               ctx.session = {
                 ...ctx.session,
@@ -857,15 +650,18 @@ export function makePiAdapter(
                 activeTurnId: turnId,
                 updatedAt,
               };
-              const turnRecord = { id: turnId, items: [] as Array<unknown> };
-              ctx.turns.push(turnRecord);
               yield* offerRuntimeEvent({
                 type: "turn.started",
                 ...(yield* makeEventStamp()),
                 provider: PROVIDER,
                 threadId: input.threadId,
                 turnId,
-                payload: ctx.currentModelId !== undefined ? { model: ctx.currentModelId } : {},
+                payload: {
+                  ...(ctx.currentModelId !== undefined ? { model: ctx.currentModelId } : {}),
+                  ...(ctx.currentThinkingLevel !== undefined
+                    ? { effort: ctx.currentThinkingLevel }
+                    : {}),
+                },
               });
             }
             // Wait only for command acceptance. The full turn remains event-driven
@@ -885,9 +681,14 @@ export function makePiAdapter(
                   ? stopSessionInternal(ctx)
                   : steering
                     ? Effect.void
-                    : settleTurn(ctx, "failed", error.message),
+                    : forceSettleTurn(ctx, "failed", error.message),
               ),
             );
+            if (steering) {
+              const lastTurnIndex = ctx.userMessagesPerTurn.length - 1;
+              ctx.userMessagesPerTurn[lastTurnIndex] =
+                (ctx.userMessagesPerTurn[lastTurnIndex] ?? 0) + 1;
+            }
             return { ctx, turnId };
           }),
         );
@@ -908,9 +709,12 @@ export function makePiAdapter(
         threadId,
         Effect.gen(function* () {
           const ctx = yield* requireSession(threadId);
-          const target = turnId ?? ctx.activeTurnId ?? ctx.session.activeTurnId;
-          if (!target || !ctx.streaming) return;
-          ctx.interruptedTurnIds.add(target);
+          const target = turnId ?? ctx.translation.activeTurnId ?? ctx.session.activeTurnId;
+          if (!target || !ctx.translation.streaming) return;
+          ctx.translation = markTurnInterrupted(ctx.translation, target);
+          // Open extension dialogs can no longer be answered once the turn
+          // is interrupted; release them before aborting.
+          yield* cancelDialogs(ctx, true);
           // Pi continues queued steering after abort unless the queue is
           // cleared first. agent_settled then settles the turn as cancelled.
           yield* ctx.runtime.request({ type: "clear_queue" }, 1_000).pipe(Effect.ignore);
@@ -935,43 +739,163 @@ export function makePiAdapter(
       _decision: ProviderApprovalDecision,
     ) => Effect.void;
 
-    // Extension dialogs are auto-cancelled inside the runtime; nothing pending
-    // survives here to answer.
+    /**
+     * Answers a Pi extension dialog. Blocking `extension_ui_request`s are
+     * surfaced as `user-input.requested`; this maps the canonical answers
+     * back into a correlated `extension_ui_response`.
+     */
     const respondToUserInput: ProviderAdapterShape<ProviderAdapterError>["respondToUserInput"] = (
       threadId,
-      _requestId,
-      _answers: ProviderUserInputAnswers,
+      requestId: ApprovalRequestId,
+      answers: ProviderUserInputAnswers,
     ) =>
-      Effect.gen(function* () {
-        yield* requireSession(threadId);
-        return;
-      }).pipe(Effect.asVoid);
+      withThreadLock(
+        threadId,
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(threadId);
+          const result = yield* resolvePiExtensionDialog(
+            ctx.translation,
+            requestId,
+            answers,
+            { provider: PROVIDER, threadId: ctx.threadId },
+            translationDeps,
+          );
+          if (result.response === undefined) return;
+          ctx.translation = result.state;
+          yield* Effect.forEach(result.events, offerRuntimeEvent, { discard: true });
+          yield* ctx.runtime.notify(result.response).pipe(
+            Effect.mapError(
+              (cause): ProviderAdapterError =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "extension_ui_response",
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+        }),
+      );
 
     const readThread: ProviderAdapterShape<ProviderAdapterError>["readThread"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
-        return { threadId, turns: ctx.turns } satisfies ProviderThreadSnapshot;
+        return { threadId, turns: ctx.translation.turns } satisfies ProviderThreadSnapshot;
       });
 
+    /**
+     * Rolls back N turns by forking the Pi session at the user message that
+     * started the oldest dropped turn. Pi implements rollback as a branch
+     * fork, which mints a new session id; the resume cursor follows so thread
+     * resume after a server restart lands on the rolled-back branch.
+     */
     const rollbackThread: ProviderAdapterShape<ProviderAdapterError>["rollbackThread"] = (
       threadId,
       numTurns,
     ) =>
-      Effect.gen(function* () {
-        yield* requireSession(threadId);
-        if (!Number.isInteger(numTurns) || numTurns < 1) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "rollbackThread",
-            issue: "numTurns must be an integer >= 1.",
-          });
-        }
-        return yield* new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "thread/rollback",
-          detail: "Pi RPC sessions do not support provider-side rollback yet.",
-        });
-      });
+      withThreadLock(
+        threadId,
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(threadId);
+          if (!Number.isInteger(numTurns) || numTurns < 1) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: "numTurns must be an integer >= 1.",
+            });
+          }
+          if (ctx.translation.streaming) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "fork",
+              detail: "Cannot roll back a Pi thread while a turn is still running.",
+            });
+          }
+          const forkData = yield* ctx.runtime.request({ type: "get_fork_messages" }).pipe(
+            Effect.mapError(
+              (cause): ProviderAdapterError =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "get_fork_messages",
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+          const forkMessages = piForkMessagesFromData(forkData);
+          // Turns from before this process started are assumed to carry one
+          // user message each; turns this process started may carry steering
+          // messages beyond the first.
+          const trackedMessages = ctx.userMessagesPerTurn.reduce((sum, count) => sum + count, 0);
+          const resumedMessageCount = Math.max(0, forkMessages.length - trackedMessages);
+          const turnCount = resumedMessageCount + ctx.userMessagesPerTurn.length;
+          if (numTurns > turnCount) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "fork",
+              detail: `Cannot roll back ${numTurns} turns; the Pi session only has ${turnCount}.`,
+            });
+          }
+          // First user message of turn (turnCount - numTurns + 1), 1-based.
+          const targetTurn = turnCount - numTurns + 1;
+          let targetIndex = targetTurn; // pre-process turns contribute 1 each
+          if (targetTurn > resumedMessageCount) {
+            targetIndex =
+              resumedMessageCount +
+              ctx.userMessagesPerTurn
+                .slice(0, targetTurn - resumedMessageCount - 1)
+                .reduce((sum, count) => sum + count, 0) +
+              1;
+          }
+          const target = forkMessages[targetIndex - 1];
+          if (target === undefined) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "fork",
+              detail: "Pi did not report a user message to fork the session back to.",
+            });
+          }
+          const forkResult = yield* ctx.runtime
+            .request({ type: "fork", entryId: target.entryId })
+            .pipe(
+              Effect.mapError(
+                (cause): ProviderAdapterError =>
+                  new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "fork",
+                    detail: cause.message,
+                    cause,
+                  }),
+              ),
+            );
+          if (forkResult["cancelled"] === true) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "fork",
+              detail: "A Pi extension cancelled the session fork.",
+            });
+          }
+          // Forking mints a new session id; adopt it so the resume cursor and
+          // any later restart land on the rolled-back branch.
+          const stateData = yield* syncSessionModelState(ctx);
+          const newSessionId = piSessionIdFromState(stateData);
+          if (newSessionId !== undefined && newSessionId !== ctx.piSessionId) {
+            ctx.piSessionId = newSessionId;
+            ctx.session = {
+              ...ctx.session,
+              resumeCursor: { schemaVersion: PI_RESUME_VERSION, sessionId: newSessionId },
+              updatedAt: yield* nowIso,
+            };
+          }
+          ctx.userMessagesPerTurn = ctx.userMessagesPerTurn.slice(
+            0,
+            Math.max(0, targetTurn - resumedMessageCount - 1),
+          );
+          const keptTurns = ctx.translation.turns.slice(0, ctx.userMessagesPerTurn.length);
+          ctx.translation = { ...ctx.translation, turns: keptTurns };
+          return { threadId, turns: ctx.translation.turns } satisfies ProviderThreadSnapshot;
+        }),
+      );
 
     const stopSession: ProviderAdapterShape<ProviderAdapterError>["stopSession"] = (threadId) =>
       withThreadLock(

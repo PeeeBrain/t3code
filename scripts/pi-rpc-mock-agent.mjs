@@ -8,9 +8,19 @@ const holdMode = NodeProcess.env["PI_MOCK_MODE"] === "hold";
 const exitMode = NodeProcess.env["PI_MOCK_MODE"] === "exit";
 const ignorePromptMode = NodeProcess.env["PI_MOCK_MODE"] === "ignore-prompt";
 const retryMode = NodeProcess.env["PI_MOCK_MODE"] === "retry";
+const dialogMode = NodeProcess.env["PI_MOCK_MODE"] === "dialog";
+const compactionFailureMode = NodeProcess.env["PI_MOCK_MODE"] === "compaction-failure";
+const extensionErrorMode = NodeProcess.env["PI_MOCK_MODE"] === "extension-error";
 const expectedThinkingLevel = NodeProcess.env["PI_EXPECT_THINKING"];
+const availableThinkingLevels = (
+  NodeProcess.env["PI_THINKING_LEVELS"] ?? "off,minimal,low,medium,high,xhigh,max"
+).split(",");
+const lineEnding = NodeProcess.env["PI_OUTPUT_CRLF"] === "1" ? "\r\n" : "\n";
+const unicodeDelta = NodeProcess.env["PI_UNICODE_SEPARATORS"] === "1" ? "\u2028middle\u2029" : " ";
 let currentThinkingLevel = "medium";
-const out = (value) => NodeProcess.stdout.write(`${JSON.stringify(value)}\n`);
+let currentSessionId = "mock-pi-session";
+const userMessages = [];
+const out = (value) => NodeProcess.stdout.write(`${JSON.stringify(value)}${lineEnding}`);
 
 const respond = (id, command, success, data) =>
   out({
@@ -27,7 +37,7 @@ function emitPromptFlow() {
   out({
     type: "message_update",
     usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11 },
-    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hello " },
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: `Hello${unicodeDelta}` },
   });
   out({
     type: "message_update",
@@ -95,9 +105,45 @@ rl.on("line", (line) => {
         thinkingLevel: currentThinkingLevel,
         isStreaming: false,
         isCompacting: false,
-        sessionId: "mock-pi-session",
+        sessionId: currentSessionId,
       });
       return;
+    case "get_available_thinking_levels":
+      respond(id, "get_available_thinking_levels", true, { levels: availableThinkingLevels });
+      return;
+    case "get_fork_messages":
+      respond(id, "get_fork_messages", true, {
+        messages: userMessages.map((text, index) => ({ entryId: `user-${index}`, text })),
+      });
+      return;
+    case "get_entries":
+      respond(id, "get_entries", true, {
+        entries: userMessages.map((text, index) => ({
+          id: `user-${index}`,
+          type: "user_message",
+          text,
+        })),
+      });
+      return;
+    case "get_tree":
+      respond(id, "get_tree", true, {
+        tree: { root: "session-root", entries: userMessages.length },
+      });
+      return;
+    case "get_last_assistant_text":
+      respond(id, "get_last_assistant_text", true, { text: "Hello world" });
+      return;
+    case "fork": {
+      const targetIndex = userMessages.findIndex((_, index) => `user-${index}` === parsed.entryId);
+      if (targetIndex < 0) {
+        respond(id, "fork", false);
+        return;
+      }
+      userMessages.splice(targetIndex);
+      currentSessionId = "mock-forked-session";
+      respond(id, "fork", true, { text: "forked", cancelled: false });
+      return;
+    }
     case "prompt":
       if (ignorePromptMode) return;
       if (expectedThinkingLevel && currentThinkingLevel !== expectedThinkingLevel) {
@@ -114,6 +160,17 @@ rl.on("line", (line) => {
         return;
       }
       respond(id, "prompt", true);
+      userMessages.push(String(parsed.message ?? ""));
+      if (dialogMode) {
+        out({
+          type: "extension_ui_request",
+          id: "mock-dialog",
+          method: "select",
+          title: "Choose",
+          options: ["Allow", "Block"],
+        });
+        return;
+      }
       if (exitMode) {
         setImmediate(() => NodeProcess.exit(17));
         return;
@@ -122,6 +179,28 @@ rl.on("line", (line) => {
       if (retryMode) {
         emitRetryFlow();
         return;
+      }
+      if (compactionFailureMode) {
+        out({ type: "agent_start" });
+        out({ type: "compaction_start", reason: "threshold" });
+        out({
+          type: "compaction_end",
+          reason: "threshold",
+          result: null,
+          aborted: false,
+          willRetry: false,
+          errorMessage: "summary failed",
+        });
+        out({ type: "agent_settled" });
+        return;
+      }
+      if (extensionErrorMode) {
+        out({
+          type: "extension_error",
+          extensionPath: "/mock/extension.ts",
+          event: "tool_call",
+          error: "extension exploded",
+        });
       }
       emitPromptFlow();
       return;
@@ -135,6 +214,13 @@ rl.on("line", (line) => {
     case "set_thinking_level":
       currentThinkingLevel = String(parsed.level ?? "");
       respond(id, "set_thinking_level", true);
+      return;
+    case "extension_ui_response":
+      if (dialogMode && parsed.id === "mock-dialog") {
+        if (parsed.value === "Allow" || parsed.confirmed === true) {
+          emitPromptFlow();
+        }
+      }
       return;
     default:
       respond(id, String(parsed.type ?? "unknown"), true);

@@ -16,6 +16,7 @@ import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 
 import {
+  ApprovalRequestId,
   PiSettings,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -166,6 +167,37 @@ it.layer(piAdapterTestLayer)("PiAdapterLive", (it) => {
     }),
   );
 
+  it.effect("keeps Unicode separators inside CRLF-framed JSON records", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-strict-jsonl");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, {
+          PI_OUTPUT_CRLF: "1",
+          PI_UNICODE_SEPARATORS: "1",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const collected = yield* collectEventsUntilTurnCompleted(adapter);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "strict framing", attachments: [] });
+      yield* collected.awaitTurnCompleted();
+      yield* collected.interrupt();
+
+      const text = collected.events
+        .filter((event) => event.type === "content.delta")
+        .map((event) => event.payload.delta)
+        .join("");
+      assert.equal(text, "Hello\u2028middle\u2029world");
+    }),
+  );
+
   it.effect("aborted turns settle as cancelled", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("pi-mock-thread-abort");
@@ -231,10 +263,7 @@ it.layer(piAdapterTestLayer)("PiAdapterLive", (it) => {
         })
         .pipe(Effect.result);
       assert.isTrue(Result.isFailure(steered));
-      assert.equal(
-        collected.events.filter((event) => event.type === "turn.completed").length,
-        0,
-      );
+      assert.equal(collected.events.filter((event) => event.type === "turn.completed").length, 0);
 
       yield* adapter.interruptTurn(threadId);
       yield* collected.awaitTurnCompleted();
@@ -246,6 +275,78 @@ it.layer(piAdapterTestLayer)("PiAdapterLive", (it) => {
       );
       assert.equal(completions.length, 1);
       assert.equal(completions[0]?.payload.state, "cancelled");
+    }),
+  );
+
+  it.effect("round-trips Pi extension dialogs through user-input events", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-extension-dialog");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, { PI_MOCK_MODE: "dialog" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const events: ProviderRuntimeEvent[] = [];
+      const requested = yield* Deferred.make<ApprovalRequestId>();
+      const completed = yield* Deferred.make<void>();
+      const fiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => events.push(event)).pipe(
+          Effect.andThen(
+            event.type === "user-input.requested" && event.requestId !== undefined
+              ? Deferred.succeed(requested, ApprovalRequestId.make(event.requestId))
+              : event.type === "turn.completed"
+                ? Deferred.succeed(completed, undefined)
+                : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "ask the extension", attachments: [] });
+      const requestId = yield* Deferred.await(requested);
+      yield* adapter.respondToUserInput(threadId, requestId, { [requestId]: "Allow" });
+      yield* Deferred.await(completed);
+      yield* Fiber.interrupt(fiber);
+
+      assert.includeMembers(
+        events.map((event) => event.type),
+        ["user-input.requested", "user-input.resolved", "turn.completed"],
+      );
+    }),
+  );
+
+  it.effect("keeps Pi's configured thinking level for the default selection", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-thinking-default");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, { PI_EXPECT_THINKING: "medium" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const collected = yield* collectEventsUntilTurnCompleted(adapter);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("pi"),
+          model: "mock/mock-model",
+          options: [{ id: "reasoningEffort", value: "default" }],
+        },
+      });
+      yield* adapter.sendTurn({ threadId, input: "keep Pi default", attachments: [] });
+      yield* collected.awaitTurnCompleted();
+      yield* collected.interrupt();
+
+      const completion = collected.events.find((event) => event.type === "turn.completed");
+      assert.isDefined(completion);
     }),
   );
 
@@ -280,6 +381,49 @@ it.layer(piAdapterTestLayer)("PiAdapterLive", (it) => {
       yield* collected.interrupt();
 
       assert.equal(sessions[0]?.model, "other/new-model");
+    }),
+  );
+
+  it.effect("rolls back provider context by forking and adopts the new session id", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-rollback");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() => makeMockPiWrapper(platform));
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const firstCompleted = yield* Deferred.make<void>();
+      const secondCompleted = yield* Deferred.make<void>();
+      let completionCount = 0;
+      const fiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type !== "turn.completed"
+          ? Effect.void
+          : Effect.gen(function* () {
+              completionCount += 1;
+              yield* completionCount === 1
+                ? Deferred.succeed(firstCompleted, undefined)
+                : Deferred.succeed(secondCompleted, undefined);
+            }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "one", attachments: [] });
+      yield* Deferred.await(firstCompleted);
+      yield* adapter.sendTurn({ threadId, input: "two", attachments: [] });
+      yield* Deferred.await(secondCompleted);
+
+      const snapshot = yield* adapter.rollbackThread(threadId, 1);
+      const sessions = yield* adapter.listSessions();
+      yield* Fiber.interrupt(fiber);
+
+      assert.equal(snapshot.turns.length, 1);
+      assert.deepEqual(sessions[0]?.resumeCursor, {
+        schemaVersion: PI_RESUME_VERSION,
+        sessionId: "mock-forked-session",
+      });
     }),
   );
 
@@ -349,6 +493,61 @@ it.layer(piAdapterTestLayer)("PiAdapterLive", (it) => {
           event.type === "turn.completed",
       );
       assert.equal(completion?.payload.state, "completed");
+    }),
+  );
+
+  it.effect("fails the turn when context compaction fails without a retry", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-compaction-failure");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, { PI_MOCK_MODE: "compaction-failure" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const collected = yield* collectEventsUntilTurnCompleted(adapter);
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({ threadId, input: "compact", attachments: [] });
+      yield* collected.awaitTurnCompleted();
+      yield* collected.interrupt();
+
+      const compaction = collected.events.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.completed" }> =>
+          event.type === "item.completed" && event.payload.itemType === "context_compaction",
+      );
+      const completion = collected.events.find((event) => event.type === "turn.completed");
+      assert.equal(compaction?.payload.status, "failed");
+      assert.equal(completion?.payload.state, "failed");
+    }),
+  );
+
+  it.effect("surfaces Pi extension errors as runtime errors", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("pi-mock-extension-error");
+      const platform = yield* HostProcessPlatform;
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockPiWrapper(platform, { PI_MOCK_MODE: "extension-error" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const collected = yield* collectEventsUntilTurnCompleted(adapter);
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("pi"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({ threadId, input: "run extension", attachments: [] });
+      yield* collected.awaitTurnCompleted();
+      yield* collected.interrupt();
+
+      const error = collected.events.find((event) => event.type === "runtime.error");
+      assert.match(error?.payload.message ?? "", /extension exploded/);
     }),
   );
 

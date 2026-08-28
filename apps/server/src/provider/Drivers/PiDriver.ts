@@ -88,6 +88,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const serverSettings = yield* ServerSettingsService;
+      const { cwd } = yield* ServerConfig;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
@@ -111,7 +112,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
       });
       const textGeneration = yield* makePiTextGeneration(effectiveConfig, processEnv);
 
-      const checkProvider = checkPiProviderStatus(effectiveConfig, processEnv).pipe(
+      const checkProvider = checkPiProviderStatus(effectiveConfig, processEnv, cwd).pipe(
         Effect.map(stampIdentity),
         Effect.provideService(Crypto.Crypto, crypto),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),

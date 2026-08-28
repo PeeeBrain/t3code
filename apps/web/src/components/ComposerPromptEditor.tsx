@@ -467,7 +467,7 @@ function skillSignature(skills: ReadonlyArray<ServerProviderSkill>): string {
         skill.displayName ?? "",
         skill.shortDescription ?? "",
         skill.description ?? "",
-        skill.path,
+        skill.path ?? "",
         skill.scope ?? "",
         skill.enabled ? "1" : "0",
       ].join("\u001f"),

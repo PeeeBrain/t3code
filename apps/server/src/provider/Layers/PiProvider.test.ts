@@ -1,10 +1,10 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
-import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
-import * as Path from "effect/Path";
+import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -13,20 +13,19 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { PiSettings } from "@t3tools/contracts";
 
-import * as NodeOS from "node:os";
-
 import {
   buildPiReasoningCapabilities,
   checkPiProviderStatus,
   countPiUpstreamProviders,
-  filterModelsByConfiguredProviders,
-  parsePiAuthProviderStore,
-  parsePiAvailableModelsResponse,
-  parsePiCommandsResponse,
+  filterModelsByReadyProviders,
+  parsePiAvailableModelsData,
+  parsePiCommandsData,
 } from "./PiProvider.ts";
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
-const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const UnknownJson = Schema.fromJsonString(Schema.Unknown);
+const encodeUnknownJson = Schema.encodeSync(UnknownJson);
+const decodeUnknownJson = Schema.decodeUnknownOption(UnknownJson);
 
 type ProbeProcess = {
   readonly stdout?: string;
@@ -56,6 +55,70 @@ function makeProbeHandle(input: ProbeProcess) {
   });
 }
 
+const rpcTemplates = (stdout: string | undefined) => {
+  const templates = new Map<string, Record<string, unknown>>();
+  for (const line of (stdout ?? "").split("\n")) {
+    if (!line.trim()) continue;
+    const decoded = decodeUnknownJson(line);
+    if (Option.isNone(decoded)) continue;
+    const value = decoded.value;
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      "type" in value &&
+      value.type === "response" &&
+      "command" in value &&
+      typeof value.command === "string"
+    ) {
+      templates.set(value.command, { ...value });
+    }
+  }
+  return templates;
+};
+
+const makeRpcProbeHandle = (input: ProbeProcess, templates: Map<string, Record<string, unknown>>) =>
+  Effect.gen(function* () {
+    const output = yield* Queue.unbounded<Uint8Array>();
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    let buffered = "";
+    const stdin = Sink.forEach((chunk: Uint8Array) =>
+      Effect.gen(function* () {
+        buffered += decoder.decode(chunk, { stream: true });
+        while (true) {
+          const newline = buffered.indexOf("\n");
+          if (newline < 0) break;
+          const line = buffered.slice(0, newline).replace(/\r$/, "");
+          buffered = buffered.slice(newline + 1);
+          const decoded = decodeUnknownJson(line);
+          if (Option.isNone(decoded)) continue;
+          const command = decoded.value;
+          if (typeof command !== "object" || command === null || !("type" in command)) continue;
+          const template = templates.get(String(command.type));
+          if (!template) continue;
+          const id = "id" in command && typeof command.id === "string" ? command.id : undefined;
+          yield* Queue.offer(
+            output,
+            encoder.encode(`${encodeUnknownJson({ ...template, ...(id ? { id } : {}) })}\n`),
+          );
+        }
+      }),
+    );
+    return ChildProcessSpawner.makeHandle({
+      pid: ChildProcessSpawner.ProcessId(1),
+      exitCode: Effect.never,
+      isRunning: Effect.succeed(true),
+      kill: () => Queue.shutdown(output),
+      unref: Effect.succeed(Effect.void),
+      stdin,
+      stdout: Stream.fromQueue(output),
+      stderr: Stream.encodeText(Stream.make(input.stderr ?? "")),
+      all: Stream.empty,
+      getInputFd: () => stdin,
+      getOutputFd: () => Stream.empty,
+    });
+  });
+
 function makeProbeSpawner(processes: ReadonlyArray<ProbeProcess>) {
   let nextProcess = 0;
   return ChildProcessSpawner.make(() =>
@@ -73,7 +136,10 @@ function makeProbeSpawner(processes: ReadonlyArray<ProbeProcess>) {
         // fiber behind for other tests in the same worker.
         return Effect.sleep("2 minutes").pipe(Effect.andThen(Effect.never));
       }
-      return Effect.sync(() => makeProbeHandle(process));
+      const templates = rpcTemplates(process.stdout);
+      return templates.size > 0
+        ? makeRpcProbeHandle(process, templates)
+        : Effect.sync(() => makeProbeHandle(process));
     }),
   );
 }
@@ -87,32 +153,6 @@ const makePiSettings = (customModels: ReadonlyArray<string> = []) =>
     customModels,
   });
 
-/**
- * Points the auth store at an isolated temp dir so the probe's model filtering
- * is hermetic; tests that exercise the store write their own auth.json there.
- */
-let isolatedAuthDirSequence = 0;
-const makeIsolatedAuthDir = Effect.gen(function* () {
-  const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const dir = path.join(
-    NodeOS.tmpdir(),
-    `t3-pi-probe-${process.pid}-${(isolatedAuthDirSequence += 1)}`,
-  );
-  yield* fileSystem.makeDirectory(dir, { recursive: true }).pipe(Effect.ignore);
-  return dir;
-});
-
-const writeAuthStore = (dir: string, store: Record<string, unknown>) =>
-  Effect.gen(function* () {
-    const fileSystem = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    yield* fileSystem.writeFile(
-      path.join(dir, "auth.json"),
-      new TextEncoder().encode(encodeUnknownJson(store)),
-    );
-  });
-
 const runCheck = (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   settings = makePiSettings(),
@@ -120,9 +160,8 @@ const runCheck = (
   options?: { readonly modelDiscoveryTimeoutMs?: number },
 ) =>
   Effect.gen(function* () {
-    const authDir = yield* makeIsolatedAuthDir;
-    const env = environment ?? { PI_CODING_AGENT_DIR: authDir };
-    return yield* checkPiProviderStatus(settings, env, options).pipe(
+    const env = environment ?? {};
+    return yield* checkPiProviderStatus(settings, env, process.cwd(), options).pipe(
       Effect.provide(
         Layer.mergeAll(
           Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -157,13 +196,16 @@ const rpcModelRow = (input: {
   };
 };
 
+const rpcModelsData = (models: ReadonlyArray<ReturnType<typeof rpcModelRow>>) => ({ models });
+const rpcCommandsData = (commands: ReadonlyArray<Record<string, unknown>>) => ({ commands });
+
 const rpcModelsLine = (models: ReadonlyArray<ReturnType<typeof rpcModelRow>>) =>
   encodeUnknownJson({
     type: "response",
     id: "t3-models",
     command: "get_available_models",
     success: true,
-    data: { models },
+    data: rpcModelsData(models),
   });
 
 const rpcCommandsLine = (commands: ReadonlyArray<Record<string, unknown>>) =>
@@ -172,7 +214,7 @@ const rpcCommandsLine = (commands: ReadonlyArray<Record<string, unknown>>) =>
     id: "t3-inventory",
     command: "get_commands",
     success: true,
-    data: { commands },
+    data: rpcCommandsData(commands),
   });
 
 const rpcInventoryStdout = (
@@ -180,10 +222,10 @@ const rpcInventoryStdout = (
   commands: Parameters<typeof rpcCommandsLine>[0],
 ) => `${rpcModelsLine(models)}\n${rpcCommandsLine(commands)}\n`;
 
-describe("parsePiAvailableModelsResponse", () => {
+describe("parsePiAvailableModelsData", () => {
   it("parses provider slugs, display names, and per-model thinking levels", () => {
-    const models = parsePiAvailableModelsResponse(
-      rpcModelsLine([
+    const models = parsePiAvailableModelsData(
+      rpcModelsData([
         rpcModelRow({
           provider: "opencode-go",
           id: "glm-5.3-flash",
@@ -193,7 +235,7 @@ describe("parsePiAvailableModelsResponse", () => {
         }),
         rpcModelRow({ provider: "opencode-go", id: "glm-5.3-flash", name: "duplicate" }),
         rpcModelRow({ provider: "openai", id: "gpt-5", reasoning: false, thinkingLevels: [] }),
-      ]) + "\n",
+      ]),
     );
 
     expect(models.map((model) => model.slug)).toEqual([
@@ -204,29 +246,35 @@ describe("parsePiAvailableModelsResponse", () => {
     const descriptor = models[0]?.capabilities?.optionDescriptors?.[0];
     expect(descriptor?.type).toBe("select");
     if (descriptor?.type === "select") {
-      expect(descriptor.options.map((option) => option.id)).toEqual(["low", "high", "max"]);
-      expect(descriptor.currentValue).toBe("max");
+      expect(descriptor.options.map((option) => option.id)).toEqual([
+        "default",
+        "low",
+        "high",
+        "max",
+      ]);
+      expect(descriptor.currentValue).toBe("default");
     }
     expect(models[1]?.capabilities?.optionDescriptors).toEqual([]);
     expect(countPiUpstreamProviders(models)).toBe(2);
   });
 
   it("falls back to the portable Off–High set when reasoning has no map", () => {
-    const models = parsePiAvailableModelsResponse(
-      rpcModelsLine([{ provider: "anthropic", id: "claude-opus-4-5", reasoning: true }]) + "\n",
+    const models = parsePiAvailableModelsData(
+      rpcModelsData([{ provider: "anthropic", id: "claude-opus-4-5", reasoning: true }]),
     );
 
     const descriptor = models[0]?.capabilities?.optionDescriptors?.[0];
     expect(descriptor?.type).toBe("select");
     if (descriptor?.type === "select") {
       expect(descriptor.options.map((option) => option.id)).toEqual([
+        "default",
         "off",
         "minimal",
         "low",
         "medium",
         "high",
       ]);
-      expect(descriptor.currentValue).toBe("medium");
+      expect(descriptor.currentValue).toBe("default");
     }
   });
 });
@@ -243,36 +291,39 @@ describe("buildPiReasoningCapabilities", () => {
     const descriptor = caps.optionDescriptors?.[0];
     expect(descriptor?.type).toBe("select");
     if (descriptor?.type === "select") {
-      expect(descriptor.options.map((option) => option.id)).toEqual(["medium", "high"]);
-      expect(descriptor.currentValue).toBe("medium");
+      expect(descriptor.options.map((option) => option.id)).toEqual(["default", "medium", "high"]);
+      expect(descriptor.currentValue).toBe("default");
     }
     expect(buildPiReasoningCapabilities(map, false).optionDescriptors).toEqual([]);
-    expect(
-      buildPiReasoningCapabilities(Object.fromEntries([["high", null]]), true).optionDescriptors,
-    ).toEqual([]);
+    const partialMap = buildPiReasoningCapabilities({ high: null, max: "max" }, true);
+    const partialDescriptor = partialMap.optionDescriptors?.[0];
+    expect(partialDescriptor?.type).toBe("select");
+    if (partialDescriptor?.type === "select") {
+      expect(partialDescriptor.options.map((option) => option.id)).toEqual([
+        "default",
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "max",
+      ]);
+    }
   });
 });
 
-describe("parsePiCommandsResponse", () => {
+describe("parsePiCommandsData", () => {
   it("separates Pi slash commands from installed skills", () => {
-    const inventory = parsePiCommandsResponse(
-      JSON.stringify({
-        type: "response",
-        command: "get_commands",
-        success: true,
-        data: {
-          commands: [
-            { name: "session-name", description: "Rename", source: "extension" },
-            {
-              name: "skill:brave-search",
-              description: "Search the web",
-              source: "skill",
-              location: "user",
-              path: "/home/user/.pi/agent/skills/brave-search/SKILL.md",
-            },
-          ],
+    const inventory = parsePiCommandsData(
+      rpcCommandsData([
+        { name: "session-name", description: "Rename", source: "extension" },
+        {
+          name: "skill:brave-search",
+          description: "Search the web",
+          source: "skill",
+          location: "user",
+          path: "/home/user/.pi/agent/skills/brave-search/SKILL.md",
         },
-      }),
+      ]),
     );
 
     expect(inventory.slashCommands).toEqual([{ name: "session-name", description: "Rename" }]);
@@ -288,36 +339,29 @@ describe("parsePiCommandsResponse", () => {
     ]);
   });
 
-  it("reads Pi 0.84.x sourceInfo metadata for skills", () => {
-    const inventory = parsePiCommandsResponse(
-      JSON.stringify({
-        type: "response",
-        command: "get_commands",
-        success: true,
-        data: {
-          commands: [
-            {
-              name: "default-header",
-              description: "Restore the built-in π header",
-              source: "extension",
-              sourceInfo: {
-                path: "C:\\Users\\user\\.pi\\agent\\extensions\\banner.ts",
-                scope: "user",
-              },
-            },
-            {
-              name: "skill:ship",
-              description: "Ship changes",
-              source: "skill",
-              sourceInfo: {
-                path: "D:\\repo\\.agents\\skills\\ship\\SKILL.md",
-                scope: "project",
-              },
-            },
-            { name: "skill:pathless", source: "skill" },
-          ],
+  it("reads Pi 0.84.x sourceInfo metadata and keeps pathless skills", () => {
+    const inventory = parsePiCommandsData(
+      rpcCommandsData([
+        {
+          name: "default-header",
+          description: "Restore the built-in π header",
+          source: "extension",
+          sourceInfo: {
+            path: "C:\\Users\\user\\.pi\\agent\\extensions\\banner.ts",
+            scope: "user",
+          },
         },
-      }),
+        {
+          name: "skill:ship",
+          description: "Ship changes",
+          source: "skill",
+          sourceInfo: {
+            path: "D:\\repo\\.agents\\skills\\ship\\SKILL.md",
+            scope: "project",
+          },
+        },
+        { name: "skill:pathless", source: "skill" },
+      ]),
     );
 
     expect(inventory.slashCommands).toEqual([
@@ -332,34 +376,22 @@ describe("parsePiCommandsResponse", () => {
         scope: "project",
         enabled: true,
       },
+      { name: "pathless", enabled: true },
     ]);
   });
 });
 
-describe("configured-provider filtering", () => {
-  it("parses auth store provider keys and ignores malformed stores", () => {
-    expect([...parsePiAuthProviderStore('{"anthropic":{},"openai-codex":{}}') ?? []]).toEqual([
-      "anthropic",
-      "openai-codex",
-    ]);
-    expect(parsePiAuthProviderStore("not json")).toBeNull();
-    expect(parsePiAuthProviderStore("[1,2]")).toBeNull();
-    expect(parsePiAuthProviderStore("{}")?.size).toBe(0);
-  });
-
-  it("keeps only models from configured providers and skips filtering without a store", () => {
-    const models = parsePiAvailableModelsResponse(
-      rpcModelsLine([
+describe("ready-provider filtering", () => {
+  it("keeps only models Pi reports as ready", () => {
+    const models = parsePiAvailableModelsData(
+      rpcModelsData([
         rpcModelRow({ provider: "anthropic", id: "claude-opus-4-5", reasoning: true }),
         rpcModelRow({ provider: "openai", id: "gpt-5", reasoning: false, thinkingLevels: [] }),
-      ]) + "\n",
+      ]),
     );
-    expect(filterModelsByConfiguredProviders(models, null)).toHaveLength(2);
-    expect(filterModelsByConfiguredProviders(models, new Set(["openai"]))).toHaveLength(1);
-    expect(filterModelsByConfiguredProviders(models, new Set(["openai"]))[0]?.slug).toBe(
-      "openai/gpt-5",
-    );
-    expect(filterModelsByConfiguredProviders(models, new Set())).toHaveLength(0);
+    expect(filterModelsByReadyProviders(models, new Set(["openai"]))).toHaveLength(1);
+    expect(filterModelsByReadyProviders(models, new Set(["openai"]))[0]?.slug).toBe("openai/gpt-5");
+    expect(filterModelsByReadyProviders(models, new Set())).toHaveLength(0);
   });
 });
 
@@ -398,6 +430,8 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
               ],
             ),
           },
+          { stdout: '{"status":"ready","provider":"anthropic"}\n' },
+          { stdout: '{"status":"ready","provider":"openai"}\n' },
         ]),
       );
 
@@ -418,10 +452,8 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
     }),
   );
 
-  it.effect("filters discovered models to providers configured in the auth store", () =>
+  it.effect("filters discovered models using Pi-owned readiness checks", () =>
     Effect.gen(function* () {
-      const authDir = yield* makeIsolatedAuthDir;
-      yield* writeAuthStore(authDir, { openai: { type: "api_key" } });
       const snapshot = yield* runCheck(
         makeProbeSpawner([
           { stdout: "pi 0.84.3\n" },
@@ -444,9 +476,10 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
               [],
             ),
           },
+          { stdout: '{"status":"not_ready","provider":"anthropic"}\n' },
+          { stdout: '{"status":"ready","provider":"openai"}\n' },
         ]),
         makePiSettings(),
-        { PI_CODING_AGENT_DIR: authDir },
       );
 
       expect(snapshot.status).toBe("ready");
@@ -460,10 +493,8 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
     }),
   );
 
-  it.effect("reports warning/unauthenticated when the auth store is present but empty", () =>
+  it.effect("reports warning/unauthenticated when Pi reports no ready provider", () =>
     Effect.gen(function* () {
-      const authDir = yield* makeIsolatedAuthDir;
-      yield* writeAuthStore(authDir, {});
       const snapshot = yield* runCheck(
         makeProbeSpawner([
           { stdout: "pi 0.84.3\n" },
@@ -473,9 +504,9 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
               [],
             ),
           },
+          { stdout: '{"status":"not_ready","provider":"anthropic"}\n' },
         ]),
         makePiSettings(),
-        { PI_CODING_AGENT_DIR: authDir },
       );
 
       expect(snapshot.status).toBe("warning");
@@ -491,12 +522,20 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
           { stdout: "pi 0.84.3\n" },
           {
             stdout: `${rpcModelsLine([
-              rpcModelRow({ provider: "openai", id: "gpt-5", reasoning: false, thinkingLevels: [] }),
+              rpcModelRow({
+                provider: "openai",
+                id: "gpt-5",
+                reasoning: false,
+                thinkingLevels: [],
+              }),
             ])}\n`,
             keepStdoutOpen: true,
           },
+          { stdout: '{"status":"ready","provider":"openai"}\n' },
         ]),
       ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("3 seconds");
       yield* Effect.yieldNow;
       yield* TestClock.adjust("3 seconds");
       const snapshot = yield* Fiber.join(fiber);
@@ -508,10 +547,8 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
     }),
   );
 
-  it.effect("reports warning/unauthenticated when the auth store filters out every model", () =>
+  it.effect("reports warning/unauthenticated when readiness filters out every model", () =>
     Effect.gen(function* () {
-      const authDir = yield* makeIsolatedAuthDir;
-      yield* writeAuthStore(authDir, { google: { type: "oauth" } });
       const snapshot = yield* runCheck(
         makeProbeSpawner([
           { stdout: "pi 0.84.3\n" },
@@ -521,9 +558,9 @@ it.layer(testLayer)("checkPiProviderStatus", (it) => {
               [],
             ),
           },
+          { stdout: '{"status":"not_ready","provider":"anthropic"}\n' },
         ]),
         makePiSettings(),
-        { PI_CODING_AGENT_DIR: authDir },
       );
 
       expect(snapshot.status).toBe("warning");
