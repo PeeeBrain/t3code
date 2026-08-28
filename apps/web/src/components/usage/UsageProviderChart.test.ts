@@ -86,7 +86,7 @@ describe("buildDayColumns", () => {
     expect(first?.bands).toEqual([
       { provider: "codex", value: 10 },
       { provider: "claude", value: 20 },
-      // Pi joins the stack in PROVIDER_ORDER once registered; inactive here.
+      { provider: "grok", value: 0 },
       { provider: "pi", value: 0 },
     ]);
   });
