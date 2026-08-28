@@ -190,17 +190,20 @@ export function makePiAdapter(
 
     /** Applies a Pi event through the pure reducer and settles the session on turn completion. */
     const ingestPiEvent = (ctx: PiSessionContext, event: PiEvent) =>
-      Effect.gen(function* () {
-        const result = yield* reducePiEvent(
-          ctx.translation,
-          event,
-          { provider: PROVIDER, threadId: ctx.threadId },
-          translationDeps,
-        );
-        ctx.translation = result.state;
-        yield* Effect.forEach(result.events, offerRuntimeEvent, { discard: true });
-        if (result.turnSettled !== undefined) yield* markSessionReady(ctx);
-      });
+      withThreadLock(
+        ctx.threadId,
+        Effect.gen(function* () {
+          const result = yield* reducePiEvent(
+            ctx.translation,
+            event,
+            { provider: PROVIDER, threadId: ctx.threadId },
+            translationDeps,
+          );
+          ctx.translation = result.state;
+          yield* Effect.forEach(result.events, offerRuntimeEvent, { discard: true });
+          if (result.turnSettled !== undefined) yield* markSessionReady(ctx);
+        }),
+      );
 
     /** Cancels open extension dialogs and pushes the cancellation responses to Pi. */
     const cancelDialogs = (ctx: PiSessionContext, sendResponses: boolean) =>
@@ -725,7 +728,7 @@ export function makePiAdapter(
           // Pi continues queued steering after abort unless the queue is
           // cleared first. agent_settled then settles the turn as cancelled.
           yield* ctx.runtime.request({ type: "clear_queue" }, 1_000).pipe(Effect.ignore);
-          yield* ctx.runtime.request({ type: "abort" }).pipe(
+          yield* ctx.runtime.notify({ type: "abort" }).pipe(
             Effect.mapError(
               (cause): ProviderAdapterError =>
                 new ProviderAdapterRequestError({
