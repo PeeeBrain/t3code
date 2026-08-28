@@ -297,11 +297,26 @@ describe("PiRpcProtocol", () => {
         lastOutputTokens: 50,
         reasoningOutputTokens: 30,
       });
+
+      const usageNoTotal = piUsage({
+        input: 40,
+        output: 20,
+      });
+      assert.deepStrictEqual(usageNoTotal, {
+        usedTokens: 60,
+        lastUsedTokens: 60,
+        inputTokens: 40,
+        lastInputTokens: 40,
+        cachedInputTokens: 0,
+        outputTokens: 20,
+        lastOutputTokens: 20,
+        reasoningOutputTokens: 0,
+      });
     });
 
     it("extracts session ID, model, and thinking level from state", () => {
       const state = {
-        sessionId: "session-abc",
+        sessionId: "  session-abc  ",
         model: { provider: "anthropic", id: "claude-3-7-sonnet" },
         thinkingLevel: "high",
       };

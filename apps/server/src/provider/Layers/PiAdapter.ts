@@ -681,7 +681,14 @@ export function makePiAdapter(
                   ? stopSessionInternal(ctx)
                   : steering
                     ? Effect.void
-                    : forceSettleTurn(ctx, "failed", error.message),
+                    : Effect.gen(function* () {
+                        yield* forceSettleTurn(ctx, "failed", error.message);
+                        ctx.userMessagesPerTurn.pop();
+                        ctx.translation = {
+                          ...ctx.translation,
+                          turns: ctx.translation.turns.filter((turn) => turn.id !== turnId),
+                        };
+                      }),
               ),
             );
             if (steering) {

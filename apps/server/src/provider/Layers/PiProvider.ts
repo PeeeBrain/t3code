@@ -348,7 +348,8 @@ const discoverPiProviderReadiness = (
         continue;
       }
       const output = check.result.success.value;
-      const status = output.code === 0 ? parsePiAuthCheck(output.stdout) : "not_ready";
+      const parsedStatus = parsePiAuthCheck(output.stdout);
+      const status = parsedStatus !== "unknown" ? parsedStatus : "unknown";
       if (status === "ready") ready.add(check.provider);
       if (status === "unknown") unknown.add(check.provider);
     }

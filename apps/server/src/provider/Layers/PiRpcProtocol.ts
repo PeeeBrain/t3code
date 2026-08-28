@@ -332,7 +332,7 @@ export type PiEvent =
   | PiExtensionUiRequest;
 
 const trimmed = (value: unknown): string | undefined =>
-  typeof value === "string" && value.trim() ? value : undefined;
+  typeof value === "string" && value.trim() ? value.trim() : undefined;
 
 const stringArray = (value: unknown): ReadonlyArray<string> =>
   Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
@@ -484,9 +484,11 @@ export function piUsage(value: Record<string, unknown> | undefined) {
   const cachedInputTokens = nonNegativeInt(value["cacheRead"]);
   const reasoning = nonNegativeInt(value["reasoning"]);
   if (input === undefined && output === undefined && totalTokens === undefined) return undefined;
+  const total =
+    totalTokens ?? (input !== undefined || output !== undefined ? (input ?? 0) + (output ?? 0) : 0);
   return {
-    usedTokens: totalTokens ?? 0,
-    lastUsedTokens: totalTokens ?? 0,
+    usedTokens: total,
+    lastUsedTokens: total,
     inputTokens: input ?? 0,
     lastInputTokens: input ?? 0,
     cachedInputTokens: cachedInputTokens ?? 0,
